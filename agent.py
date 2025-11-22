@@ -80,7 +80,6 @@ class PPOAgent:
         gae_lambda=0.95,
     ):
 
-        # Agent Identification and Auction Parameters
         self.id = agent_id
         self.actual_v = actual_v  # This will be set by the auction simulation logic
         self.v_i = None  # Current realized private value
