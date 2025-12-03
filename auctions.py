@@ -2,6 +2,9 @@ import numpy as np
 from dataclasses import dataclass
 from typing import List, Tuple
 from matplotlib import pyplot as plt
+from regret_matching import RegretMatchingAgent
+from q_learning import QLearningAgent
+from ppo_agent import PPOAgent
 
 @dataclass
 class AuctionOutcome:
@@ -28,179 +31,7 @@ class FirstPriceAuction:
             all_bids=bids.copy(),
             utilities=utilities  # agents compute their own utility since they know their v
         )
-
-
-class Agent:
-    def __init__(self, agent_id: int, learning_rate: float = 0.01):
-        self.agent_id = agent_id
-        self.theta = np.random.uniform(0, 0.5)  # start with some shading
-        self.lr = learning_rate
-        self.history = []  # track (v, bid, utility, theta) for analysis
         
-    def draw_value(self) -> float:
-        """draw private value for this auction"""
-        return np.random.uniform(0, 1)
-    
-    def compute_bid(self, value: float) -> float:
-        """bid = v * (1 - theta)"""
-        return value * (1 - self.theta)
-    
-    def compute_utility(self, value: float, won: bool, price_paid: float) -> float:
-        """utility = v - price if won, else 0"""
-        return (value - price_paid) if won else 0.0
-    
-    def update(self, value: float, bid: float, utility: float):
-        """policy gradient update on theta"""
-        # gradient of log(policy) w.r.t theta
-        # policy is deterministic bid = v(1-theta), so we use score function
-        # simplified: gradient points toward increasing utility
-        
-        # if utility > 0 (won profitably): could shade more (increase theta)
-        # if utility = 0 (lost): should shade less (decrease theta)
-        # this is rough heuristic, you'll tune this
-        
-        if utility > 0:
-            # won - consider shading more next time
-            gradient = value  # direction to increase theta
-            self.theta += self.lr * utility * (gradient / (value + 1e-8))
-        else:
-            # lost - shade less
-            gradient = -value
-            self.theta -= self.lr * 0.1  # small nudge toward bidding higher
-        
-        # keep theta in reasonable bounds
-        self.theta = np.clip(self.theta, 0, 0.99)
-        
-        self.history.append((value, bid, utility, self.theta))
-
-class RegretMatchingAgent(Agent):
-    """
-    Regret matching guarantees convergence to the set of correlated equilibria, which can be broader than nash.
-    """
-    def __init__(self, agent_id: int):
-        super().__init__(agent_id)
-        # discretize theta space
-        # self.theta_options = np.linspace(0, 0.9, 20)
-        self.theta_options = np.linspace(0, 1.0, 500) # more theta options to choose from
-        self.cumulative_regret = np.zeros(len(self.theta_options))
-        self.strategy = np.ones(len(self.theta_options)) / len(self.theta_options)
-        
-    def choose_theta(self) -> float:
-        # sample theta according to regret-matched strategy
-        # theta is shading factor of their value
-        return np.random.choice(self.theta_options, p=self.strategy)
-
-    def update(self, value: float, chosen_theta: float, outcome):
-        bid = value * (1 - chosen_theta)
-        won = (outcome.winner_idx == self.agent_id)
-        utility = self.compute_utility(value, won, outcome.winning_bid)
-        
-        # track history for diagnostics
-        self.history.append((value, bid, utility, chosen_theta))
-        
-        # find the highest bid that WASN'T mine
-        other_bids = outcome.all_bids.copy()
-        other_bids[self.agent_id] = -1  # mask out my bid
-        highest_other_bid = np.max(other_bids)
-        
-        # calculate utility for each alternative theta
-        for i, alt_theta in enumerate(self.theta_options):
-            alt_bid = value * (1 - alt_theta)
-            
-            # would i win against the other bids?
-            if alt_bid > highest_other_bid:
-                alt_utility = value - alt_bid  # win, pay my bid
-            elif alt_bid == highest_other_bid:
-                alt_utility = 0.5 * (value - alt_bid)  # tie, 50% chance
-            else:
-                alt_utility = 0  # lose
-            
-            regret = alt_utility - utility
-            self.cumulative_regret[i] += regret
-        
-        # update strategy
-        positive_regret = np.maximum(self.cumulative_regret, 0)
-        if positive_regret.sum() > 0:
-            self.strategy = positive_regret / positive_regret.sum()
-        else:
-            self.strategy = np.ones(len(self.theta_options)) / len(self.theta_options)
-
-class QLearningAgent(Agent):
-    def __init__(
-        self,
-        agent_id: int,
-        n_value_bins: int = 10,
-        theta_options: np.ndarray = None,
-        alpha: float = 0.1,    
-        gamma: float = 0.0,     
-        epsilon: float = 0.1    
-    ):
-        super().__init__(agent_id)
-        self.n_value_bins = n_value_bins
-        self.alpha = alpha
-        self.gamma = gamma
-        self.epsilon = epsilon
-
-        if theta_options is None:
-            theta_options = np.linspace(0, 1.0, 500)
-        self.theta_options = theta_options
-
-        self.Q = np.zeros((self.n_value_bins, len(self.theta_options)))
-
-        self.current_value = None
-        self.current_state_idx = None
-        self.current_action_idx = None
-
-        self.history = []  
-
-    def _value_to_state(self, v: float) -> int:
-        idx = int(v * self.n_value_bins)
-        if idx == self.n_value_bins: 
-            idx = self.n_value_bins - 1
-        return idx
-
-    def draw_value(self) -> float:
-        v = np.random.uniform(0.0, 1.0)
-        self.current_value = v
-        self.current_state_idx = self._value_to_state(v)
-        return v
-
-    def choose_theta(self) -> float:
-        assert self.current_state_idx is not None, "call draw_value() before choose_theta()"
-        s = self.current_state_idx
-
-        if np.random.rand() < self.epsilon:
-            a = np.random.randint(len(self.theta_options))
-        else:
-            a = np.argmax(self.Q[s])
-
-        self.current_action_idx = a
-        theta = self.theta_options[a]
-        return theta
-
-    def update(self, value: float, chosen_theta: float, outcome):
-        # compute realized utility
-        bid = value * (1 - chosen_theta)
-        won = (outcome.winner_idx == self.agent_id)
-        utility = self.compute_utility(value, won, outcome.winning_bid)
-
-        # log for diagnostics
-        self.history.append((value, bid, utility, chosen_theta))
-
-        # Q-learning update
-        s = self._value_to_state(value)
-        a = self.current_action_idx
-        r = utility
-
-        # single-step auction, treat next-state value as irrelevant (gamma=0)
-        # target = r + gamma * max_a' Q(s', a')  -> here gamma=0 => target = r
-        target = r
-        self.Q[s, a] = (1 - self.alpha) * self.Q[s, a] + self.alpha * target
-        # if you later want gamma>0, you could sample/approximate s_next here
-
-        # optional: you could adapt epsilon over time if you want annealing
-        # self.epsilon = max(self.epsilon * 0.9999, 0.01)
-
 def plot_results(n_agents, theta_hist, avg_theta_hist, efficiency_hist, revenue_hist):
     """Plot auction simulation results"""
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
@@ -259,65 +90,72 @@ def plot_results(n_agents, theta_hist, avg_theta_hist, efficiency_hist, revenue_
 def run_simulation(n_agents: int, n_rounds: int):
     auction = FirstPriceAuction(n_agents)
     # agents = [Agent(i) for i in range(n_agents)]
-    agents = [QLearningAgent(i) for i in range(n_agents)]
+    # agents = [QLearningAgent(i) for i in range(n_agents)]
+    # agents = [PPOAgent(i, initial_budget=n_rounds * 1000, total_auctions=n_rounds) for i in range(n_agents)]
+    auctions_per_episode = 50 # for PPO agents
+    agents = [PPOAgent(
+        i, 
+        initial_budget=50.0,  # budget for one episode
+        total_auctions=auctions_per_episode
+    ) for i in range(n_agents)]
     
     # tracking for plots
+    total_rounds = 0
     theta_hist = [[] for _ in range(n_agents)]
     avg_theta_hist = []
     efficiency_hist = []
     revenue_hist = []
-    
-    for round_idx in range(n_rounds):
-        # each agent draws value and computes bid
-        values = np.array([agent.draw_value() for agent in agents])
-        thetas = [agent.choose_theta() for agent in agents]  # new: sample theta
-        bids = np.array([values[i] * (1 - thetas[i]) for i in range(n_agents)])
-        # bids = np.array([agents[i].compute_bid(values[i]) for i in range(n_agents)])
+    winners = [0 for _ in range(n_agents)]
+
         
-        # run auction
-        outcome = auction.run_auction(bids)
+    for episode in range(n_rounds):
+        # reset all agents for new episode
+        for agent in agents:
+            agent.reset()
         
-        # agents update based on outcome
-        for i, agent in enumerate(agents):
-            if isinstance(agent, RegretMatchingAgent) or isinstance(agent, QLearningAgent):
+        for round_idx in range(auctions_per_episode):
+            # draw values
+            values = np.array([agent.draw_value() for agent in agents])
+            thetas = [agent.choose_theta() for agent in agents]
+            bids = np.array([values[i] * thetas[i] for i in range(n_agents)])
+            
+            # run auction
+            outcome = auction.run_auction(bids)
+            winners[outcome.winner_idx] += 1
+            # agents update
+            for i, agent in enumerate(agents):
                 agent.update(values[i], thetas[i], outcome)
-            else:
-                won = (i == outcome.winner_idx)
-                price = outcome.winning_bid if won else 0
-                utility = agent.compute_utility(values[i], won, price)
-                agent.update(values[i], bids[i], utility)
-        
-        # track metrics
-        for i in range(n_agents):
-            theta_hist[i].append(thetas[i])
-        
-        avg_theta_hist.append(np.mean(thetas))
-        
-        # efficiency: did highest-value agent win?
-        highest_value_idx = np.argmax(values)
-        efficiency_hist.append(1.0 if outcome.winner_idx == highest_value_idx else 0.0)
-        
-        # revenue: winning bid
-        revenue_hist.append(outcome.winning_bid)
-        
-        # log stuff every k rounds
-        if round_idx % 5000 == 0:
-            if isinstance(agents[0], RegretMatchingAgent):
-                # expected theta under current strategy
-                avg_thetas = [np.dot(a.strategy, a.theta_options) for a in agents]
-                avg_theta = np.mean(avg_thetas)
-            else:
-                avg_theta = np.mean([a.theta for a in agents])
-            print(f"round {round_idx}: avg_theta={avg_theta:.3f}, theory={1/n_agents:.3f}")
-            # i think the theory is 1/n, but it could be different! 
+            
+            # tracking
+            for i in range(n_agents):
+                theta_hist[i].append(thetas[i])
+            
+            avg_theta_hist.append(np.mean(thetas))
+            
+            # efficiency: did highest-value agent win?
+            highest_value_idx = np.argmax(values)
+            efficiency_hist.append(1.0 if outcome.winner_idx == highest_value_idx else 0.0)
+            
+            # revenue: winning bid
+            revenue_hist.append(outcome.winning_bid)
+            
+            total_rounds += 1
+            
+            if total_rounds % 1000 == 0:
+                avg_theta = np.mean([np.mean(agent.history[-100:], axis=0)[3]
+                                    for agent in agents if len(agent.history) >= 100])
+                theta_variance = np.var([np.mean(agent.history[-100:], axis=0)[3]
+                                        for agent in agents if len(agent.history) >= 100])
+                print(f"round {total_rounds}: avg_theta={avg_theta:.3f}, var={theta_variance:.4f}, theory={(n_agents - 1)/n_agents:.3f}")
 
     # add after round 49000
     print("\nfinal diagnostics:")
     for i, agent in enumerate(agents):
         avg_utility = np.mean([h[2] for h in agent.history[-1000:]])  # last 1k rounds
-        win_rate = np.mean([h[2] > 0 for h in agent.history[-1000:]])
+        win_rate = winners[i]/sum(winners)
         print(f"agent {i}: avg_utility={avg_utility:.4f}, win_rate={win_rate:.3f}")
 
+    print('total sum of winners (sanity check):', sum(winners))
     # check strategy concentration
     if isinstance(agent, RegretMatchingAgent):
         print(f"\nagent 0 final strategy (top 5):")
@@ -334,5 +172,5 @@ def run_simulation(n_agents: int, n_rounds: int):
     return agents
 
 # test
-agents = run_simulation(n_agents=10, n_rounds=50000)
+agents = run_simulation(n_agents=10, n_rounds=1000)
 
