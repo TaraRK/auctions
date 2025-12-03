@@ -1,8 +1,11 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from agent import Agent
 from torch import optim
+from torch.distributions import Normal, TransformedDistribution
+from torch.distributions.transforms import TanhTransform, AffineTransform
+from agent import Agent
+
 
 class PPOAgent(Agent):
     def __init__(
@@ -18,13 +21,14 @@ class PPOAgent(Agent):
         vf_coef: float = 0.5,
         update_epochs: int = 4,
         buffer_size: int = 128,
+        max_grad_norm: float = 0.5,
     ):
         super().__init__(agent_id)
         self.initial_budget = initial_budget
         self.total_auctions = total_auctions
         self.budget = initial_budget
         self.auctions_remaining = total_auctions
-        
+
         self.lr = lr
         self.gamma = gamma
         self.gae_lambda = gae_lambda
@@ -33,18 +37,19 @@ class PPOAgent(Agent):
         self.vf_coef = vf_coef
         self.update_epochs = update_epochs
         self.buffer_size = buffer_size
-        
-        # state is now [value, budget_fraction, auctions_remaining_fraction]
+        self.max_grad_norm = max_grad_norm
+
+        # state = [value, budget_fraction, auctions_remaining_fraction]
         self.actor_mean = nn.Sequential(
             nn.Linear(3, 64),
             nn.Tanh(),
             nn.Linear(64, 64),
             nn.Tanh(),
-            nn.Linear(64, 1),
-            nn.Sigmoid()  # outputs fraction of value to bid
+            nn.Linear(64, 1)   # no sigmoid; we handle bounds via transforms
         )
+        # global log std works; you can later make it state-dependent
         self.actor_log_std = nn.Parameter(torch.zeros(1))
-        
+
         self.critic = nn.Sequential(
             nn.Linear(3, 64),
             nn.Tanh(),
@@ -52,187 +57,196 @@ class PPOAgent(Agent):
             nn.Tanh(),
             nn.Linear(64, 1)
         )
-        
+
         self.optimizer = optim.Adam(
-            list(self.actor_mean.parameters()) + 
-            list(self.critic.parameters()) + 
-            [self.actor_log_std],
-            lr=lr
+            list(self.actor_mean.parameters())
+            + list(self.critic.parameters())
+            + [self.actor_log_std],
+            lr=lr,
         )
-        
+
         self.buffer = {
-            'values': [],
-            'actions': [],
-            'logprobs': [],
-            'rewards': [],
-            'dones': [],
-            'states': []
+            "values": [],
+            "actions": [],
+            "logprobs": [],
+            "rewards": [],
+            "dones": [],
+            "states": [],
         }
-        
+
         self.current_value = None
         self.current_state = None
         self.current_theta = None
         self.current_logprob = None
-        
+
+    # ---------- basic episode plumbing ----------
+
     def reset(self):
-        """reset budget and auction count for new episode"""
         self.budget = self.initial_budget
         self.auctions_remaining = self.total_auctions
-        
+
     def get_state(self, value: float) -> torch.Tensor:
-        """state = [value, budget/initial_budget, auctions_remaining/total]"""
-        return torch.tensor([
-            value,
-            self.budget / self.initial_budget,
-            self.auctions_remaining / self.total_auctions
-        ], dtype=torch.float32)
-    
+        return torch.tensor(
+            [
+                value,
+                self.budget / self.initial_budget,
+                self.auctions_remaining / self.total_auctions,
+            ],
+            dtype=torch.float32,
+        )
+
     def draw_value(self) -> float:
         v = np.random.uniform(0.0, 1.0)
         self.current_value = v
         self.current_state = self.get_state(v)
         return v
-    
-    def choose_theta(self) -> float:
 
-        # compute feasible theta range
-        max_feasible_bid = min(self.current_value, self.budget)
-        max_feasible_theta = max_feasible_bid / (self.current_value + 1e-8)
-        max_feasible_theta = min(max_feasible_theta, 1.0)
-        
+    # ---------- key fix: consistent, bounded action distribution ----------
+
+    def _max_theta_from_state(self, states: torch.Tensor) -> torch.Tensor:
+        """
+        per-state feasible upper bound for theta (bid/value).
+        theta ∈ [0, min(value, budget)/value] = [0, max_theta]
+        """
+        # states[..., 0] = value, states[..., 1] = budget_frac
+        value = states[..., 0].clamp(min=1e-8)
+        budget = states[..., 1] * self.initial_budget
+        max_bid = torch.minimum(value, budget)
+        max_theta = (max_bid / value).clamp(0.0, 1.0)
+        # tiny floor prevents degenerate transforms when budget ≈ 0
+        return torch.maximum(max_theta, torch.tensor(1e-6, dtype=states.dtype))
+
+    def _policy_dist(self, states: torch.Tensor):
+        """
+        base gaussian on R → tanh to (−1,1) → affine to (0,1) → scale to (0, max_theta).
+        TransformedDistribution takes care of log-det jacobians, so log_prob is correct.
+        """
+        loc = self.actor_mean(states)                      # shape [..., 1]
+        # clamp log_std to sane range to avoid pathological std
+        log_std = self.actor_log_std.clamp(min=-5.0, max=2.0)
+        std = log_std.exp().expand_as(loc)
+        base = Normal(loc, std)
+
+        max_theta = self._max_theta_from_state(states).unsqueeze(-1)
+        transforms = [
+            TanhTransform(cache_size=1),                   # (−1,1)
+            AffineTransform(loc=0.5, scale=0.5),          # (x+1)/2 → (0,1)
+            AffineTransform(loc=0.0, scale=max_theta),    # (0,1) → (0, max_theta)
+        ]
+        dist = TransformedDistribution(base, transforms)
+        return dist, max_theta
+
+    def choose_theta(self) -> float:
         with torch.no_grad():
-            raw_mean = self.actor_mean(self.current_state)  # in [0,1]
-            
-            # squash mean into feasible range [0, max_feasible_theta]
-            mean = raw_mean * max_feasible_theta
-            
-            std = torch.exp(self.actor_log_std)
-            dist = torch.distributions.Normal(mean, std)
-            action = dist.sample()
-            action = torch.clamp(action, 0, max_feasible_theta)
-            logprob = dist.log_prob(action).sum()
-        
+            s = self.current_state.unsqueeze(0)            # [1,3]
+            dist, _ = self._policy_dist(s)
+            action = dist.sample()                         # [1,1] in [0, max_theta]
+            logprob = dist.log_prob(action).sum(dim=-1)    # [1]
         self.current_theta = action.item()
         self.current_logprob = logprob.item()
         self.theta = self.current_theta
         return self.current_theta
-    
-        # with torch.no_grad():
-        #     mean = self.actor_mean(self.current_state)  # theta in [0,1]
-        #     std = torch.exp(self.actor_log_std)
-        #     dist = torch.distributions.Normal(mean, std)
-        #     sampled_action = dist.sample()
-        #     sampled_action = torch.clamp(sampled_action, 0, 1)
-        #     logprob = dist.log_prob(sampled_action).sum()
-            
-        #     # compute actual bid respecting budget
-        #     bid = sampled_action.item() * self.current_value
-        #     bid = min(bid, self.budget)
-        #     actual_theta = bid / (self.current_value + 1e-8)
-        
-        # # store sampled action for policy gradient
-        # self.current_theta = actual_theta  # what we actually bid
-        # self.sampled_theta = sampled_action.item()  # what network output
-        # self.current_logprob = logprob.item()
-        # self.theta = actual_theta
-        # return actual_theta
 
-    
+    # ---------- env update + buffer ----------
+
     def update(self, value: float, chosen_theta: float, outcome):
         bid = value * chosen_theta
         won = (outcome.winner_idx == self.agent_id)
-        price_paid = outcome.winning_bid if won else 0.0
-        
+        too_expensive = False
+        # first-price: you pay your own bid if you win
+        price_paid = outcome.payments[self.agent_id]
+        # price_paid = bid if won else 0.0
+
         # can't pay more than budget
-        if won and price_paid > self.budget:
-            won = False  # forfeit if can't afford
+        if won and price_paid > self.budget + 1e-12:
+            too_expensive = True
+            won = False
             price_paid = 0.0
+
+        utility = outcome.utilities[self.agent_id] if too_expensive is False else 0.0
+        # utility = self.compute_utility(value, won, price_paid)
+
+        # if not np.isfinite(utility):
+        #     print(f"[warning] non-finite utility for agent {self.agent_id}, skipping transition")
+        #     return
+
+        # budget & time
         
-        utility = self.compute_utility(value, won, price_paid)
-        
-        # update budget and auctions
-        if won:
-            self.budget -= price_paid
+        self.budget -= price_paid
         self.auctions_remaining -= 1
-        
-        done = (self.budget <= 0 or self.auctions_remaining == 0)
-        
+        done = (self.budget <= 0.0) or (self.auctions_remaining == 0)
+
+        # track (value, bid, utility, theta)
         self.history.append((value, bid, utility, chosen_theta))
-        
-        # store transition
+
         with torch.no_grad():
-            val = self.critic(self.current_state).item()
-        
-        self.buffer['states'].append(self.current_state.numpy())
-        self.buffer['actions'].append(chosen_theta)
-        # self.buffer['actions'].append(self.sampled_theta)
-        self.buffer['logprobs'].append(self.current_logprob)
-        self.buffer['rewards'].append(utility)
-        self.buffer['values'].append(val)
-        self.buffer['dones'].append(done)
-        
+            val = self.critic(self.current_state.unsqueeze(0)).squeeze().item()
+
+        # store transition
+        self.buffer["states"].append(self.current_state.numpy())
+        self.buffer["actions"].append(chosen_theta)
+        self.buffer["logprobs"].append(self.current_logprob)
+        self.buffer["rewards"].append(utility)
+        self.buffer["values"].append(val)
+        self.buffer["dones"].append(float(done))
+
         # update when buffer full or episode done
-        if len(self.buffer['states']) >= self.buffer_size or done:
+        if len(self.buffer["states"]) >= self.buffer_size or done:
             self._ppo_update()
             for k in self.buffer:
                 self.buffer[k] = []
-            
-            # if done:
-            #     self.reset()
-    
+
+    # ---------- ppo core ----------
+
     def _ppo_update(self):
-        states = torch.tensor(np.array(self.buffer['states']), dtype=torch.float32)
-        actions = torch.tensor(self.buffer['actions'], dtype=torch.float32).unsqueeze(1)
-        old_logprobs = torch.tensor(self.buffer['logprobs'], dtype=torch.float32)
-        rewards = torch.tensor(self.buffer['rewards'], dtype=torch.float32)
-        old_values = torch.tensor(self.buffer['values'], dtype=torch.float32)
-        dones = torch.tensor(self.buffer['dones'], dtype=torch.float32)
-        
+        states = torch.tensor(np.array(self.buffer["states"]), dtype=torch.float32)   # [T,3]
+        actions = torch.tensor(self.buffer["actions"], dtype=torch.float32).unsqueeze(1)  # [T,1]
+        old_logprobs = torch.tensor(self.buffer["logprobs"], dtype=torch.float32)     # [T]
+        rewards = torch.tensor(self.buffer["rewards"], dtype=torch.float32)           # [T]
+        dones = torch.tensor(self.buffer["dones"], dtype=torch.float32)               # [T]
+
+        # critic values at states (fixed for GAE computation)
         with torch.no_grad():
-            values = self.critic(states).squeeze()
+            values = self.critic(states).squeeze()                                    # [T]
             advantages = torch.zeros_like(rewards)
-            lastgaelam = 0
-            
+            lastgaelam = 0.0
             for t in reversed(range(len(rewards))):
                 if t == len(rewards) - 1:
-                    nextnonterminal = 1.0 - dones[t]
-                    nextvalues = 0 if dones[t] else values[t]
+                    next_nonterminal = 1.0 - dones[t]
+                    next_value = 0.0 if dones[t] > 0.5 else values[t]
                 else:
-                    nextnonterminal = 1.0 - dones[t + 1]
-                    nextvalues = values[t + 1]
-                
-                delta = rewards[t] + self.gamma * nextvalues * nextnonterminal - values[t]
-                advantages[t] = lastgaelam = delta + self.gamma * self.gae_lambda * nextnonterminal * lastgaelam
-            
+                    next_nonterminal = 1.0 - dones[t + 1]
+                    next_value = values[t + 1]
+                delta = rewards[t] + self.gamma * next_value * next_nonterminal - values[t]
+                lastgaelam = delta + self.gamma * self.gae_lambda * next_nonterminal * lastgaelam
+                advantages[t] = lastgaelam
             returns = advantages + values
-        
+
+        # standardize advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
+
         for _ in range(self.update_epochs):
-            mean = self.actor_mean(states)
-            std = torch.exp(self.actor_log_std)
-            dist = torch.distributions.Normal(mean, std)
-            new_logprobs = dist.log_prob(actions).sum(dim=1)
-            entropy = dist.entropy().sum(dim=1)
-            
+            # same distribution as at act-time (same transforms, same max_theta from states)
+            dist, _ = self._policy_dist(states)
+            new_logprobs = dist.log_prob(actions).sum(dim=1)                           # [T]
+            # entropy of base gaussian is fine for a signal (exact transformed entropy is messy)
+            entropy = dist.base_dist.entropy().sum(dim=1).mean()
+
             new_values = self.critic(states).squeeze()
-            
-            ratio = torch.exp(new_logprobs - old_logprobs)
+
+            ratio = (new_logprobs - old_logprobs).exp()
             pg_loss1 = -advantages * ratio
-            pg_loss2 = -advantages * torch.clamp(ratio, 1 - self.clip_coef, 1 + self.clip_coef)
+            pg_loss2 = -advantages * ratio.clamp(1.0 - self.clip_coef, 1.0 + self.clip_coef)
             pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-            
+
             v_loss = 0.5 * ((new_values - returns) ** 2).mean()
-            entropy_loss = entropy.mean()
-            
-            loss = pg_loss - self.ent_coef * entropy_loss + self.vf_coef * v_loss
-            
+
+            loss = pg_loss - self.ent_coef * entropy + self.vf_coef * v_loss
+
             self.optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(
-                list(self.actor_mean.parameters()) + 
-                list(self.critic.parameters()) + 
-                [self.actor_log_std],
-                0.5
+                list(self.actor_mean.parameters()) + list(self.critic.parameters()) + [self.actor_log_std],
+                self.max_grad_norm,
             )
             self.optimizer.step()

@@ -1,6 +1,6 @@
 import torch
-import test_agent
-from test_agent import *
+import agent
+from agent import *
 
 
 class Environment(nn.Module):
