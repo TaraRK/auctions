@@ -148,7 +148,7 @@ def run_perfect_info_baseline(n_agents, n_rounds):
     ax.legend()
     
     plt.tight_layout()
-    plt.savefig('auction_first_price_perfect_info_baseline.png', dpi=150)
+    plt.savefig('graphs/auction_first_price_perfect_info_baseline.png', dpi=150)
     plt.close()  # Close to avoid showing plot during batch run
     
     return {
@@ -277,14 +277,14 @@ for info_type in InformationType:
         print(f"{info_type.value:<25} {ucb_theta:<15.3f} {eps_theta:<18.3f} {diff:<15.3f}")
 
 print("\n" + "=" * 90)
-print("PLOT FILES GENERATED:")
+print("PLOT FILES GENERATED (in graphs/ folder):")
 print("=" * 90)
-print("  - auction_first_price_perfect_info_baseline.png")
+print("  - graphs/auction_first_price_perfect_info_baseline.png")
 for agent_type in ["ucb", "epsilon_greedy"]:
     for info_type in InformationType:
         key = (agent_type, info_type)
         if key in results:
-            filename = f"auction_first_price_{info_type.value}_{agent_type}.png"
+            filename = f"graphs/auction_first_price_{info_type.value}_{agent_type}.png"
             print(f"  - {filename}")
 
 # Summary and conclusions

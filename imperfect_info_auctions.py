@@ -568,7 +568,7 @@ class BanditAgent:
         The agent only uses the information revealed to them (in outcome.agent_info).
         """
         info = outcome.agent_info[self.agent_id]
-        bid = value * (1 - chosen_theta)
+        bid = value * chosen_theta
         won = info.won
         utility = self.compute_utility(value, won, outcome.winning_bid)
         
@@ -662,7 +662,7 @@ class EpsilonGreedyBanditAgent:
     
     def update(self, value: float, chosen_theta: float, outcome: AuctionOutcome):
         info = outcome.agent_info[self.agent_id]
-        bid = value * (1 - chosen_theta)
+        bid = value * chosen_theta
         won = info.won
         utility = self.compute_utility(value, won, outcome.winning_bid)
         
@@ -752,7 +752,7 @@ def plot_imperfect_info_results(
     
     plt.tight_layout()
     agent_suffix = f"_{agent_type}" if agent_type else ""
-    filename = f'auction_{auction_type.value if auction_type else "first_price"}_{info_type.value}{agent_suffix}.png'
+    filename = f'graphs/auction_{auction_type.value if auction_type else "first_price"}_{info_type.value}{agent_suffix}.png'
     plt.savefig(filename, dpi=150)
     plt.close()  # Close to avoid showing plot during batch run
 
@@ -854,11 +854,11 @@ def run_imperfect_info_simulation(
         
         # Run auction based on type
         if auction_type == AuctionType.FIRST_PRICE:
-            bids = np.array([values[i] * (1 - thetas[i]) for i in range(n_agents)])
+            bids = np.array([values[i] * thetas[i] for i in range(n_agents)])
             outcome = auction.run_auction(bids, values)
         elif auction_type == AuctionType.ASCENDING_CLOCK:
             # For ascending clock: theta determines max willingness to pay
-            max_willingness = np.array([values[i] * (1 - thetas[i]) for i in range(n_agents)])
+            max_willingness = np.array([values[i] * thetas[i] for i in range(n_agents)])
             
             def dropout_decisions(price, active_agents, values, max_willingness):
                 decisions = np.zeros(n_agents, dtype=bool)
@@ -871,7 +871,7 @@ def run_imperfect_info_simulation(
             outcome = auction.run_auction(dropout_decisions, values, max_willingness)
         elif auction_type == AuctionType.DESCENDING_CLOCK:
             # For descending clock: theta determines min willingness to pay
-            min_willingness = np.array([values[i] * (1 - thetas[i]) for i in range(n_agents)])
+            min_willingness = np.array([values[i] * thetas[i] for i in range(n_agents)])
             
             def dropout_decisions(price, active_agents, values, min_willingness):
                 decisions = np.zeros(n_agents, dtype=bool)
