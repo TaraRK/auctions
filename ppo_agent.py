@@ -39,9 +39,17 @@ class PPOAgent(Agent):
         self.buffer_size = buffer_size
         self.max_grad_norm = max_grad_norm
 
-        # state = [value, budget_fraction, auctions_remaining_fraction]
+        # State size is dynamic based on information revelation
+        # Base: 3 (value, budget_frac, auctions_frac)
+        # + 1 (won indicator)
+        # + 1 (winning_bid if revealed)
+        # + 10 (losing_bids if revealed, max 10)
+        # + 10 (all_bids if FULL_TRANSPARENCY/REVELATION, max 10)
+        # Max state size: 3 + 1 + 1 + 10 + 10 = 25
+        # We'll use max size to allow flexibility, but state can be smaller
+        self.state_dim = 25  # Maximum state dimension
         self.actor_mean = nn.Sequential(
-            nn.Linear(3, 64),
+            nn.Linear(self.state_dim, 64),
             nn.Tanh(),
             nn.Linear(64, 64),
             nn.Tanh(),
@@ -51,7 +59,7 @@ class PPOAgent(Agent):
         self.actor_log_std = nn.Parameter(torch.zeros(1))
 
         self.critic = nn.Sequential(
-            nn.Linear(3, 64),
+            nn.Linear(self.state_dim, 64),
             nn.Tanh(),
             nn.Linear(64, 64),
             nn.Tanh(),
@@ -85,20 +93,69 @@ class PPOAgent(Agent):
         self.budget = self.initial_budget
         self.auctions_remaining = self.total_auctions
 
-    def get_state(self, value: float) -> torch.Tensor:
-        return torch.tensor(
-            [
-                value,
-                self.budget / self.initial_budget,
-                self.auctions_remaining / self.total_auctions,
-            ],
-            dtype=torch.float32,
-        )
+    def get_state(self, value: float, agent_info=None) -> torch.Tensor:
+        """
+        Get state representation including revealed information
+        
+        Args:
+            value: Agent's private value
+            agent_info: AgentInformation object with revealed information (optional)
+        
+        Returns:
+            State tensor with:
+            - Basic: [value, budget_frac, auctions_frac]
+            - Won: [1 if won, 0 if lost]
+            - Winning bid: [winning_bid] if revealed
+            - Losing bids: [losing_bids...] if revealed (for winner)
+            - All bids: [all_bids...] if FULL_TRANSPARENCY or FULL_REVELATION
+            - Payment: [own_payment] if FULL_REVELATION
+        """
+        state = [
+            value,
+            self.budget / self.initial_budget,
+            self.auctions_remaining / self.total_auctions,
+        ]
+        
+        if agent_info is not None:
+            # Won/lost indicator
+            state.append(1.0 if agent_info.won else 0.0)
+            
+            # Winning bid if revealed
+            if agent_info.winning_bid is not None:
+                state.append(agent_info.winning_bid)
+            
+            # Losing bids if revealed (for winner)
+            if agent_info.losing_bids is not None:
+                # Normalize losing bids (max 10 to keep state size reasonable)
+                losing_bids = agent_info.losing_bids[:10]
+                state.extend(losing_bids.tolist())
+                # Pad with zeros if fewer than 10
+                if len(losing_bids) < 10:
+                    state.extend([0.0] * (10 - len(losing_bids)))
+            
+            # All bids if FULL_TRANSPARENCY or FULL_REVELATION
+            if agent_info.all_bids is not None:
+                # Normalize all bids (max 10 to keep state size reasonable)
+                all_bids = agent_info.all_bids[:10]
+                state.extend(all_bids.tolist())
+                # Pad with zeros if fewer than 10
+                if len(all_bids) < 10:
+                    state.extend([0.0] * (10 - len(all_bids)))
+        
+        return torch.tensor(state, dtype=torch.float32)
 
     def draw_value(self) -> float:
         v = np.random.uniform(0.0, 1.0)
         self.current_value = v
-        self.current_state = self.get_state(v)
+        # Initialize state with just basic info (no agent_info yet)
+        basic_state = torch.tensor([
+            v,
+            self.budget / self.initial_budget,
+            self.auctions_remaining / self.total_auctions,
+        ], dtype=torch.float32)
+        # Pad to max dimension
+        self.current_state = torch.zeros(self.state_dim)
+        self.current_state[:len(basic_state)] = basic_state
         return v
 
     # ---------- key fix: consistent, bounded action distribution ----------
@@ -153,9 +210,13 @@ class PPOAgent(Agent):
         bid = value * chosen_theta
         won = (outcome.winner_idx == self.agent_id)
         too_expensive = False
-        # first-price: you pay your own bid if you win
-        price_paid = outcome.payments[self.agent_id]
-        # price_paid = bid if won else 0.0
+        
+        # Get payment: if won, winning_bid is the payment (set in AMD simulation)
+        # If lost, payment is 0
+        if won:
+            price_paid = outcome.winning_bid  # In AMD, winning_bid is set to the actual payment
+        else:
+            price_paid = 0.0
 
         # can't pay more than budget
         if won and price_paid > self.budget + 1e-12:
@@ -163,15 +224,10 @@ class PPOAgent(Agent):
             won = False
             price_paid = 0.0
 
+        # Use utility from outcome (already computed as value - payment)
         utility = outcome.utilities[self.agent_id] if too_expensive is False else 0.0
-        # utility = self.compute_utility(value, won, price_paid)
-
-        # if not np.isfinite(utility):
-        #     print(f"[warning] non-finite utility for agent {self.agent_id}, skipping transition")
-        #     return
 
         # budget & time
-        
         self.budget -= price_paid
         self.auctions_remaining -= 1
         done = (self.budget <= 0.0) or (self.auctions_remaining == 0)
@@ -179,11 +235,25 @@ class PPOAgent(Agent):
         # track (value, bid, utility, theta)
         self.history.append((value, bid, utility, chosen_theta))
 
+        # Get agent_info from outcome if available (for state representation)
+        agent_info = None
+        if hasattr(outcome, 'agent_info') and self.agent_id in outcome.agent_info:
+            agent_info = outcome.agent_info[self.agent_id]
+        
+        # Update state with revealed information
+        self.current_state = self.get_state(value, agent_info)
+        
+        # Pad state to max dimension if needed
+        state_padded = torch.zeros(self.state_dim)
+        state_len = self.current_state.shape[0]
+        state_padded[:state_len] = self.current_state
+        self.current_state = state_padded
+
         with torch.no_grad():
             val = self.critic(self.current_state.unsqueeze(0)).squeeze().item()
 
-        # store transition
-        self.buffer["states"].append(self.current_state.numpy())
+        # store transition (use tolist() for NumPy 2.x compatibility)
+        self.buffer["states"].append(self.current_state.cpu().detach().tolist())
         self.buffer["actions"].append(chosen_theta)
         self.buffer["logprobs"].append(self.current_logprob)
         self.buffer["rewards"].append(utility)

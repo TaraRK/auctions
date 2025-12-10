@@ -95,10 +95,17 @@ class PaymentNetwork(nn.Module):
     P network: Payment function
     Input: bids, winner index, allocation
     Output: Payment amount for each agent
+    
+    Args:
+        max_payment_multiplier: Maximum payment as multiple of max_bid.
+                                Default None = no constraint (auctioneer can charge anything).
+                                Set to 1.0 for first-price style (payment ≤ bid).
+                                Set to 1.5 for 1.5× max_bid constraint.
     """
-    def __init__(self, n_agents: int, hidden_dim: int = 64):
+    def __init__(self, n_agents: int, hidden_dim: int = 64, max_payment_multiplier: float = None):
         super(PaymentNetwork, self).__init__()
         self.n_agents = n_agents
+        self.max_payment_multiplier = max_payment_multiplier  # None = no constraint (auctioneer can charge anything)
         
         input_dim = n_agents * 3
         
@@ -109,6 +116,16 @@ class PaymentNetwork(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, n_agents)
         )
+        
+        # Initialize final layer to output payments closer to bids initially
+        # This helps the network start in a reasonable range instead of near zero
+        with torch.no_grad():
+            # Initialize final layer bias to ~0.0 (let network learn from scratch)
+            # This prevents anchoring payments at a fixed value
+            if hasattr(self.net[-1], 'bias') and self.net[-1].bias is not None:
+                self.net[-1].bias.fill_(0.0)  # Start at zero, let learning determine optimal payments
+            # Scale down weights so initial outputs are small but learnable
+            self.net[-1].weight.data *= 0.01  # Smaller initial weights for more gradual learning
     
     def forward(self, bids: torch.Tensor, winner_idx: int, allocation: torch.Tensor) -> torch.Tensor:
         """
@@ -131,18 +148,37 @@ class PaymentNetwork(nn.Module):
         x = torch.cat([bids, winner_one_hot, allocation], dim=-1)
         
         payments = self.net(x)
-        payments = torch.relu(payments)
+        payments = torch.relu(payments)  # Ensure non-negative payments (only constraint: payments ≥ 0)
        
-        if bids.dim() == 1:
-            max_bid = torch.max(bids).item()
-        else:
-            max_bid = torch.max(bids, dim=-1)[0].item()
-        max_payment = max_bid * 1.5
-        payments = torch.clamp(payments, min=0.0, max=max_payment)
+        # ============================================================
+        # PAYMENT CONSTRAINT (Optional)
+        # 
+        # When max_payment_multiplier = None (default):
+        #   - NO UPPER BOUND (infinite/unbounded)
+        #   - This entire if block is SKIPPED
+        #   - Payments can be any positive value (only limited by network output)
+        #   - No cap based on bids, values, or any other amount
+        #
+        # When max_payment_multiplier is set (e.g., 1.0, 1.5, etc.):
+        #   - Payments are capped at: multiplier × max_bid
+        #   - Lines 151-156 below execute to enforce this constraint
+        # ============================================================
+        if self.max_payment_multiplier is not None:
+            # This block ONLY executes when max_payment_multiplier is NOT None
+            # When None, this entire block is SKIPPED - no constraint applied
+            if bids.dim() == 1:
+                max_bid = torch.max(bids).item()
+            else:
+                max_bid = torch.max(bids, dim=-1)[0].item()
+            max_payment = max_bid * self.max_payment_multiplier  # Line 155: Only runs if multiplier is set
+            payments = torch.clamp(payments, min=0.0, max=max_payment)  # Line 156: Only runs if multiplier is set
+        # When max_payment_multiplier = None: The if block above is SKIPPED
+        # Result: payments are UNBOUNDED (infinite) - no max_payment constraint
         
         return payments
     
-    def compute_payments(self, bids: np.ndarray, winner_idx: int, allocation: np.ndarray) -> np.ndarray:
+    def compute_payments(self, bids: np.ndarray, winner_idx: int, allocation: np.ndarray, 
+                        values: np.ndarray = None) -> np.ndarray:
         """
         Compute payments for all agents
         
@@ -150,6 +186,7 @@ class PaymentNetwork(nn.Module):
             bids: Array of bids from all agents
             winner_idx: Index of winning agent
             allocation: Allocation probabilities or binary allocation
+            values: Agent values (optional, for individual rationality constraint)
         
         Returns:
             payments: Payment amount for each agent
@@ -162,6 +199,15 @@ class PaymentNetwork(nn.Module):
             payments_tensor = self.forward(bids_tensor, winner_idx, allocation_tensor)
             payments_list = payments_tensor.squeeze().cpu().detach().tolist()
             payments = np.array(payments_list, dtype=np.float64)
+            
+            # ============================================================
+            # NO CONSTRAINTS: Let natural dynamics work
+            # - If auctioneer charges too high → agents get negative utility → learn to bid lower/avoid
+            # - If agents bid too low → they don't win → learn to bid higher
+            # - Natural market forces, no artificial constraints
+            # ============================================================
+            # No payment constraints - network can charge anything
+            # Agents will learn naturally: negative utility → adjust strategy
         
         return payments
 
@@ -175,13 +221,14 @@ class LearningAuctioneer:
         n_agents: int,
         lr: float = 1e-3,
         hidden_dim: int = 64,
-        allocation_temperature: float = 1.0
+        allocation_temperature: float = 1.0,
+        max_payment_multiplier: float = None  
     ):
         self.n_agents = n_agents
         self.allocation_temperature = allocation_temperature
         
         self.G_network = AllocationNetwork(n_agents, hidden_dim)
-        self.P_network = PaymentNetwork(n_agents, hidden_dim)
+        self.P_network = PaymentNetwork(n_agents, hidden_dim, max_payment_multiplier=max_payment_multiplier)
         
         self.optimizer = optim.Adam(
             list(self.G_network.parameters()) + list(self.P_network.parameters()),
@@ -213,7 +260,9 @@ class LearningAuctioneer:
         """
         winner_idx, allocation_probs = self.G_network.allocate(bids, self.allocation_temperature)
         
-        payments = self.P_network.compute_payments(bids, winner_idx, allocation_probs)
+        # No constraints - let natural dynamics work
+        # If payment > value, agent gets negative utility and learns to avoid
+        payments = self.P_network.compute_payments(bids, winner_idx, allocation_probs, values=None)
         
         utilities = np.zeros(self.n_agents)
         utilities[winner_idx] = values[winner_idx] - payments[winner_idx]
@@ -222,7 +271,7 @@ class LearningAuctioneer:
         revenue = payments[winner_idx] 
         
         if hasattr(self, 'collect_experience'):
-            self.collect_experience(bids, allocation_probs, payments, revenue)
+            self.collect_experience(bids, allocation_probs, payments, revenue, values)
         
         agent_info = self._reveal_information(bids, values, winner_idx, payments, info_type)
         
@@ -311,7 +360,7 @@ class LearningAuctioneer:
         return agent_info
     
     def collect_experience(self, bids: np.ndarray, allocation_probs: np.ndarray, 
-                          payments: np.ndarray, revenue: float):
+                          payments: np.ndarray, revenue: float, values: np.ndarray = None):
         """
         Collect experience for training (REINFORCE)
         
@@ -320,15 +369,23 @@ class LearningAuctioneer:
             allocation_probs: Allocation probabilities from G network
             payments: Payments from P network
             revenue: Revenue from this auction
+            values: Agent values (for individual rationality constraint)
         """
         if not hasattr(self, 'experience_buffer'):
             self.experience_buffer = []
+        
+        # Track average bid level to see if bids are decreasing over time
+        avg_bid = np.mean(bids)
+        max_bid = np.max(bids)
         
         self.experience_buffer.append({
             'bids': bids.copy(),
             'allocation_probs': allocation_probs.copy(),
             'payments': payments.copy(),
-            'revenue': revenue
+            'revenue': revenue,
+            'avg_bid': avg_bid,
+            'max_bid': max_bid,
+            'values': values.copy() if values is not None else None
         })
         
         self.history['revenue'].append(revenue)
@@ -367,15 +424,30 @@ class LearningAuctioneer:
             payments_tensor = self.P_network.forward(bids, winner_idx, allocation_probs)
             
             # REINFORCE loss: -log_prob * (reward - baseline)
-            # We want to maximize revenue, so minimize negative revenue
+            # Reward: raw revenue
+            # The feedback loop works naturally:
+            # - High payments → agents bid lower (in next phase) → revenue decreases (in next training)
+            # - Network sees lower revenue when it trains next → learns to charge less
+            # - No explicit penalties needed - the natural feedback loop should work
             advantage = revenue - baseline
             
             # Loss from allocation: weighted by allocation probability
             allocation_loss = -torch.sum(allocation_log_probs * allocation_probs) * advantage
             
-            # Loss from payment: encourage higher payments (simplified)
-            # Payment network should maximize sum of payments
-            payment_loss = -torch.sum(payments_tensor) * 0.1  # Scale down payment gradient
+            # ============================================================
+            # PAYMENT LOSS: Learn from feedback loop
+            # The network should learn: high payments → lower bids → lower future revenue
+            # We use the actual revenue as reward - if payments are too high, 
+            # agents will bid lower in next phase, reducing revenue, and network learns
+            # ============================================================
+            winner_payment = payments_tensor[0, winner_idx]
+            
+            # Simple REINFORCE: maximize revenue
+            # The feedback loop works because:
+            # - High payments → agents bid lower → future revenue decreases
+            # - Network sees lower revenue in next training phase → learns to charge less
+            # - This creates natural learning without explicit penalties
+            payment_loss = -winner_payment * advantage
             
             loss = allocation_loss + payment_loss
             total_loss += loss
@@ -404,12 +476,12 @@ def run_amd_simulation(
     n_agents: int,
     n_rounds: int,
     info_type: InformationType = InformationType.MINIMAL,
-    agent_type: str = "regret_matching",  # "ucb", "epsilon_greedy", or "regret_matching"
+    agent_type: str = "ppo",  # "ucb", "epsilon_greedy", "regret_matching", or "ppo"
     theta_options: np.ndarray = None,
     lr_auctioneer: float = 1e-3,
     allocation_temperature: float = 1.0,
     alternate_training: bool = True,
-    training_interval: int = 100
+    training_interval: int = 50
 ):
     """
     Run AMD simulation with learning agents and learning auctioneer
@@ -446,13 +518,18 @@ def run_amd_simulation(
         agents = [EpsilonGreedyBanditAgent(i, theta_options=theta_options) for i in range(n_agents)]
     elif agent_type == "regret_matching":
         # RegretMatchingAgent doesn't need theta_options (has its own)
-        agents = [RegretMatchingAgent(i) for i in range(n_agents)]
+        # Use learning_rate=0.1 and regret_decay=0.999 to slow down convergence
+        agents = [RegretMatchingAgent(i, learning_rate=0.1, regret_decay=0.999) for i in range(n_agents)]
         # Note: RegretMatching requires all_bids, so info_type should be FULL_TRANSPARENCY or FULL_REVELATION
         if info_type not in [InformationType.FULL_TRANSPARENCY, InformationType.FULL_REVELATION]:
             print(f"Warning: RegretMatchingAgent requires all_bids. "
                   f"Current info_type={info_type.value} may not work properly.")
+    elif agent_type == "ppo":
+        from ppo_agent import PPOAgent
+        # PPO agents: no budget constraints for single-shot auctions, but keep for compatibility
+        agents = [PPOAgent(i, initial_budget=1000.0, total_auctions=n_rounds) for i in range(n_agents)]
     else:
-        raise ValueError(f"Unknown agent_type: {agent_type}. Use 'ucb', 'epsilon_greedy', or 'regret_matching'")
+        raise ValueError(f"Unknown agent_type: {agent_type}. Use 'ucb', 'epsilon_greedy', 'regret_matching', or 'ppo'")
     
     # Create learning auctioneer
     auctioneer = LearningAuctioneer(n_agents, lr=lr_auctioneer, allocation_temperature=allocation_temperature)
@@ -485,25 +562,48 @@ def run_amd_simulation(
         
         outcome = auctioneer.run_auction(bids, values, info_type)
         
+        # For agent learning: 
+        # - winning_bid is set to payment (what winner actually pays)
+        #   because compute_utility uses winning_bid as price_paid
+        # - This is correct for AMD where payment ≠ bid (learned payment mechanism)
         winning_payment = outcome.payments[outcome.winner_idx]
         
         agent_outcome = AuctionOutcome(
             winner_idx=outcome.winner_idx,
-            winning_bid=winning_payment,
+            winning_bid=winning_payment,  # Use payment (not bid) for compute_utility
             all_bids=bids.copy(),
-            utilities=outcome.utilities,
+            utilities=outcome.utilities,  # These are already correct (value - payment)
             agent_info=outcome.agent_info
         )
         
         if train_agents:
             for i, agent in enumerate(agents):
-                agent.update(values[i], thetas[i], agent_outcome)
+                # For regret matching in AMD: pass auctioneer to compute counterfactual payments
+                if agent_type == "regret_matching":
+                    agent.update(values[i], thetas[i], agent_outcome, auctioneer=auctioneer, all_values=values)
+                else:
+                    # PPO and bandit agents use standard update
+                    agent.update(values[i], thetas[i], agent_outcome)
         else:
             pass
         
         if not train_agents:
             should_train = (round_idx % training_interval == 0) or (len(auctioneer.experience_buffer) >= training_interval)
             if should_train and len(auctioneer.experience_buffer) > 0:
+                # Debug: Check what network is learning
+                if round_idx % 5000 == 0:
+                    avg_bid_in_buffer = np.mean([np.mean(exp['bids']) for exp in auctioneer.experience_buffer])
+                    max_bid_in_buffer = np.mean([np.max(exp['bids']) for exp in auctioneer.experience_buffer])
+                    avg_payment_in_buffer = np.mean([exp['payments'][exp['winner_idx']] for exp in auctioneer.experience_buffer])
+                    avg_revenue_in_buffer = np.mean([exp['revenue'] for exp in auctioneer.experience_buffer])
+                    payment_ratio = avg_payment_in_buffer / avg_bid_in_buffer if avg_bid_in_buffer > 0 else 0
+                    print(f"  [Auctioneer Training @ Round {round_idx}]")
+                    print(f"    Avg bid in buffer: {avg_bid_in_buffer:.4f}, Max bid: {max_bid_in_buffer:.4f}")
+                    print(f"    Avg payment in buffer: {avg_payment_in_buffer:.4f}")
+                    print(f"    Payment/Bid ratio: {payment_ratio:.2f}x")
+                    print(f"    Avg revenue in buffer: {avg_revenue_in_buffer:.4f}")
+                    print(f"    Buffer size: {len(auctioneer.experience_buffer)}")
+                
                 loss = auctioneer.train_step()
                 auctioneer_loss_hist.append(loss)
         
@@ -516,6 +616,9 @@ def run_amd_simulation(
         if agent_type == "regret_matching":
             expected_thetas = [np.dot(agent.strategy, agent.theta_options) for agent in agents]
             avg_theta_hist.append(np.mean(expected_thetas))
+        elif agent_type == "ppo":
+            # PPO agents have theta directly
+            avg_theta_hist.append(np.mean(thetas))
         else:
             avg_theta_hist.append(np.mean(thetas))
         
@@ -531,15 +634,11 @@ def run_amd_simulation(
             if agent_type == "regret_matching":
                 # Calculate concentration metrics for RegretMatching
                 concentrations = []
-                entropies = []
-                for agent in agents:
-                    strategy = agent.strategy
-                    # Strategy entropy (lower = more concentrated)
-                    entropy = -np.sum(strategy * np.log(strategy + 1e-10))
-                    max_entropy = np.log(len(strategy))
-                    concentration = 1 - (entropy / max_entropy)  # 0 = uniform, 1 = concentrated
-                    concentrations.append(concentration)
-                    entropies.append(entropy)
+            elif agent_type == "ppo":
+                # PPO: Use variance of theta as concentration metric (lower variance = more concentrated)
+                theta_vars = [np.var([t for t in theta_hist[i][-100:]]) if len(theta_hist[i]) >= 100 else 0.0 for i in range(n_agents)]
+                concentrations = [1.0 / (1.0 + var) for var in theta_vars]  # Inverse variance as concentration
+                entropies = [0.0] * n_agents  # Not applicable for PPO (continuous action space)
                 
                 strategy_concentration_hist.append(np.mean(concentrations))
                 strategy_entropy_hist.append(np.mean(entropies))
@@ -770,6 +869,19 @@ def extract_agent_strategies(agents, agent_type: str):
                     'theta': agent.theta_options[idx],
                     'probability': agent.strategy[idx]
                 })
+    elif agent_type == "ppo":
+        # PPO: Extract mean theta from recent history
+        for i, agent in enumerate(agents):
+            if hasattr(agent, 'history') and len(agent.history) > 0:
+                recent_thetas = [h[3] for h in agent.history[-100:]]  # Last 100 thetas
+                mean_theta = np.mean(recent_thetas) if recent_thetas else agent.theta
+            else:
+                mean_theta = agent.theta
+            strategies[i] = {
+                'type': 'ppo',
+                'mean_theta': mean_theta,
+                'current_theta': agent.theta
+            }
     
     return strategies
 
@@ -957,18 +1069,18 @@ if __name__ == "__main__":
     print("=" * 60)
     print(f"Agents: {n_agents}")
     print(f"Rounds: {n_rounds}")
-    print("Alternating training: Every 100 rounds")
+    print("Alternating training: Every 50 rounds")
     print("="*60)
     
     # Test with RegretMatching agents (uses revealed information)
     agents, auctioneer, metrics = run_amd_simulation(
         n_agents=n_agents,
         n_rounds=n_rounds,
-        info_type=InformationType.FULL_REVELATION,  # RegretMatching needs all_bids
-        agent_type="regret_matching",  # Use RegretMatching instead of bandits
+        info_type=InformationType.FULL_REVELATION,  # PPO can use any info type
+        agent_type="ppo",  # Use PPO (much faster than regret matching)
         theta_options=None,  # Not needed for RegretMatching
         alternate_training=True,
-        training_interval=100
+        training_interval=50
     )
     
     print("\n" + "=" * 60)
