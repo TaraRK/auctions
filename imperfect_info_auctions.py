@@ -16,6 +16,7 @@ class InformationType(Enum):
     WINNER = "winner"  # Winner learns losing bid(s)
     LOSER = "loser"  # Loser learns winning bid
     FULL_TRANSPARENCY = "full_transparency"  # Everyone sees all bids
+    FULL_REVELATION = "full_revelation"  # Sealed-bid: All info revealed after auction (all bids, all values, all payments)
 
 
 @dataclass
@@ -104,6 +105,17 @@ class FirstPriceAuction:
             
             elif self.info_type == InformationType.FULL_TRANSPARENCY:
                 # Everyone sees all bids
+                agent_info[i] = AgentInformation(
+                    won=won,
+                    own_bid=own_bid,
+                    own_value=own_value,
+                    winning_bid=winning_bid,
+                    all_bids=bids.copy()
+                )
+            
+            elif self.info_type == InformationType.FULL_REVELATION:
+                # Sealed-bid: All information revealed after auction
+                # Everyone sees all bids (same as full transparency)
                 agent_info[i] = AgentInformation(
                     won=won,
                     own_bid=own_bid,
