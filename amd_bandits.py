@@ -465,7 +465,9 @@ def run_amd_simulation(
     allocation_hist = []
     payment_hist = []
     auctioneer_loss_hist = []
-    training_phase_hist = []  
+    training_phase_hist = []  # Track which phase we're in
+    strategy_concentration_hist = []  # Track strategy concentration over time
+    strategy_entropy_hist = []  # Track strategy entropy over time
     
     train_agents = True  
     auctioneer.experience_buffer = []
@@ -524,6 +526,43 @@ def run_amd_simulation(
         allocation_hist.append(outcome.allocation.copy())
         payment_hist.append(outcome.payments.copy())
         
+        # Track strategy concentration over time (every 100 rounds for efficiency)
+        if round_idx % 100 == 0:
+            if agent_type == "regret_matching":
+                # Calculate concentration metrics for RegretMatching
+                concentrations = []
+                entropies = []
+                for agent in agents:
+                    strategy = agent.strategy
+                    # Strategy entropy (lower = more concentrated)
+                    entropy = -np.sum(strategy * np.log(strategy + 1e-10))
+                    max_entropy = np.log(len(strategy))
+                    concentration = 1 - (entropy / max_entropy)  # 0 = uniform, 1 = concentrated
+                    concentrations.append(concentration)
+                    entropies.append(entropy)
+                
+                strategy_concentration_hist.append(np.mean(concentrations))
+                strategy_entropy_hist.append(np.mean(entropies))
+            else:
+                # For bandits, track Q-value concentration
+                # Use variance of best thetas as proxy for concentration
+                best_thetas = []
+                for agent in agents:
+                    # Get best theta for each value bin
+                    best_theta_per_bin = []
+                    for state in range(agent.n_value_bins):
+                        best_arm = np.argmax(agent.Q[state])
+                        best_theta = agent.theta_options[best_arm]
+                        best_theta_per_bin.append(best_theta)
+                    best_thetas.append(np.mean(best_theta_per_bin))
+                
+                # Lower variance = more concentrated/symmetric
+                theta_variance = np.var(best_thetas)
+                # Convert to concentration metric (inverse of variance, normalized)
+                concentration = 1.0 / (1.0 + theta_variance * 10)  # Scale factor
+                strategy_concentration_hist.append(concentration)
+                strategy_entropy_hist.append(theta_variance)  # Store variance as "entropy"
+        
         if round_idx % 5000 == 0:
             if agent_type == "regret_matching":
                 expected_thetas = [np.dot(agent.strategy, agent.theta_options) for agent in agents]
@@ -558,9 +597,12 @@ def run_amd_simulation(
         'auctioneer_loss_hist': auctioneer_loss_hist,
         'training_phase_hist': training_phase_hist,
         'avg_theta_hist': avg_theta_hist,
+        'strategy_concentration_hist': strategy_concentration_hist,
+        'strategy_entropy_hist': strategy_entropy_hist,
         'final_avg_theta': final_avg_theta,
         'final_efficiency': final_efficiency,
-        'final_revenue': final_revenue
+        'final_revenue': final_revenue,
+        'agent_type': agent_type  # Store agent type for strategy analysis
     }
 
 
@@ -635,8 +677,35 @@ def plot_amd_convergence(metrics: Dict, n_agents: int, save_path: str = 'graphs/
         ax.set_title('Auctioneer Training Loss')
     
     
-    # 5. Final theta distribution
+    # 5. Strategy concentration over time
     ax = axes[2, 0]
+    if 'strategy_concentration_hist' in metrics and len(metrics['strategy_concentration_hist']) > 0:
+        concentration_hist = metrics['strategy_concentration_hist']
+        # Convert to round indices (every 100 rounds)
+        round_indices = np.arange(len(concentration_hist)) * 100
+        ax.plot(round_indices, concentration_hist, linewidth=2, label='concentration')
+        ax.set_xlabel('round')
+        ax.set_ylabel('strategy concentration')
+        ax.set_title('Strategy Concentration Over Time\n(1=concentrated, 0=uniform)')
+        ax.set_ylim(0, 1)
+        ax.grid(True, alpha=0.3)
+        # Add horizontal line at uniform (0)
+        ax.axhline(y=0, color='r', linestyle='--', alpha=0.5, label='uniform')
+        ax.legend()
+    else:
+        # Fallback to final theta distribution if no concentration data
+        theta_hist = metrics['theta_hist']
+        final_thetas = [hist[-1] for hist in theta_hist if len(hist) > 0]
+        if len(final_thetas) > 0:
+            ax.hist(final_thetas, bins=20, alpha=0.7)
+            ax.axvline(x=(n_agents-1)/n_agents, color='r', linestyle='--', label='theory')
+            ax.set_xlabel('final theta')
+            ax.set_ylabel('count')
+            ax.set_title('Final Theta Distribution')
+            ax.legend()
+    
+    # 6. Final theta distribution (or empty)
+    ax = axes[2, 1]
     theta_hist = metrics['theta_hist']
     final_thetas = [hist[-1] for hist in theta_hist if len(hist) > 0]
     if len(final_thetas) > 0:
@@ -653,10 +722,231 @@ def plot_amd_convergence(metrics: Dict, n_agents: int, save_path: str = 'graphs/
     plt.close()
 
 
+def extract_agent_strategies(agents, agent_type: str):
+    """
+    Extract learned strategies from agents
+    
+    Args:
+        agents: List of agents
+        agent_type: "ucb", "epsilon_greedy", or "regret_matching"
+    
+    Returns:
+        Dictionary with strategy information
+    """
+    strategies = {}
+    
+    if agent_type in ["ucb", "epsilon_greedy"]:
+        # Bandit agents: Extract Q-tables
+        for i, agent in enumerate(agents):
+            strategies[i] = {
+                'type': 'bandit',
+                'Q_table': agent.Q.copy(),  # [n_value_bins, n_arms]
+                'theta_options': agent.theta_options.copy(),
+                'n_value_bins': agent.n_value_bins,
+                'best_theta_per_state': []
+            }
+            
+            # For each value bin, find best theta
+            for state in range(agent.n_value_bins):
+                best_arm = np.argmax(agent.Q[state])
+                best_theta = agent.theta_options[best_arm]
+                strategies[i]['best_theta_per_state'].append(best_theta)
+    
+    elif agent_type == "regret_matching":
+        # RegretMatching: Extract strategy distribution
+        for i, agent in enumerate(agents):
+            strategies[i] = {
+                'type': 'regret_matching',
+                'strategy': agent.strategy.copy(),  # Probability distribution
+                'theta_options': agent.theta_options.copy(),
+                'expected_theta': np.dot(agent.strategy, agent.theta_options),
+                'top_thetas': []
+            }
+            
+            # Get top 5 most likely thetas
+            top_indices = np.argsort(agent.strategy)[-5:][::-1]
+            for idx in top_indices:
+                strategies[i]['top_thetas'].append({
+                    'theta': agent.theta_options[idx],
+                    'probability': agent.strategy[idx]
+                })
+    
+    return strategies
+
+
+def plot_agent_strategies(agents, agent_type: str, n_agents: int, 
+                          save_path: str = 'graphs/agent_strategies.png'):
+    """
+    Visualize learned strategies for all agents
+    
+    Args:
+        agents: List of agents
+        agent_type: Type of agents
+        n_agents: Number of agents
+        save_path: Path to save plot
+    """
+    strategies = extract_agent_strategies(agents, agent_type)
+    
+    if agent_type in ["ucb", "epsilon_greedy"]:
+        # Bandit strategies: Show Q-tables as heatmaps
+        fig, axes = plt.subplots(2, (n_agents + 1) // 2, figsize=(15, 10))
+        if n_agents == 1:
+            axes = [axes]
+        else:
+            axes = axes.flatten()
+        
+        for i, agent in enumerate(agents):
+            ax = axes[i]
+            Q = strategies[i]['Q_table']
+            theta_options = strategies[i]['theta_options']
+            
+            # Show Q-values as heatmap (value_bin vs theta)
+            # For clarity, show every 10th theta option
+            theta_indices = np.arange(0, len(theta_options), max(1, len(theta_options) // 50))
+            Q_subset = Q[:, theta_indices]
+            theta_subset = theta_options[theta_indices]
+            
+            im = ax.imshow(Q_subset.T, aspect='auto', origin='lower', cmap='viridis')
+            ax.set_xlabel('Value Bin')
+            ax.set_ylabel('Theta Index')
+            ax.set_title(f'Agent {i} Q-Table\n(Expected Theta: {np.mean(strategies[i]["best_theta_per_state"]):.3f})')
+            ax.set_yticks(range(0, len(theta_subset), max(1, len(theta_subset) // 5)))
+            ax.set_yticklabels([f'{theta_subset[j]:.2f}' for j in range(0, len(theta_subset), max(1, len(theta_subset) // 5))])
+            plt.colorbar(im, ax=ax, label='Q-value')
+        
+        # Hide unused subplots
+        for i in range(n_agents, len(axes)):
+            axes[i].axis('off')
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150)
+        print(f"Strategy heatmaps saved to {save_path}")
+        plt.close()
+    
+    elif agent_type == "regret_matching":
+        # RegretMatching strategies: Show probability distributions
+        fig, axes = plt.subplots(2, (n_agents + 1) // 2, figsize=(15, 10))
+        if n_agents == 1:
+            axes = [axes]
+        else:
+            axes = axes.flatten()
+        
+        for i, agent in enumerate(agents):
+            ax = axes[i]
+            strategy = strategies[i]['strategy']
+            theta_options = strategies[i]['theta_options']
+            expected_theta = strategies[i]['expected_theta']
+            
+            # Plot strategy distribution
+            ax.plot(theta_options, strategy, linewidth=2)
+            ax.axvline(x=expected_theta, color='r', linestyle='--', 
+                      label=f'Expected: {expected_theta:.3f}')
+            ax.axvline(x=(n_agents-1)/n_agents, color='g', linestyle='--', 
+                      label=f'Theory: {(n_agents-1)/n_agents:.3f}')
+            ax.set_xlabel('Theta')
+            ax.set_ylabel('Probability')
+            ax.set_title(f'Agent {i} Strategy Distribution')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+        
+        # Hide unused subplots
+        for i in range(n_agents, len(axes)):
+            axes[i].axis('off')
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150)
+        print(f"Strategy distributions saved to {save_path}")
+        plt.close()
+
+
+def print_strategy_summary(agents, agent_type: str, n_agents: int):
+    """
+    Print summary of learned strategies
+    
+    Args:
+        agents: List of agents
+        agent_type: Type of agents
+        n_agents: Number of agents
+    """
+    strategies = extract_agent_strategies(agents, agent_type)
+    
+    print("\n" + "=" * 80)
+    print("LEARNED STRATEGY SUMMARY")
+    print("=" * 80)
+    
+    if agent_type in ["ucb", "epsilon_greedy"]:
+        print(f"\nBandit Agents ({agent_type}):")
+        print(f"{'Agent':<10} {'Avg Theta':<15} {'Theta Range':<20} {'Top Theta':<15}")
+        print("-" * 80)
+        
+        for i in range(n_agents):
+            best_thetas = strategies[i]['best_theta_per_state']
+            avg_theta = np.mean(best_thetas)
+            theta_range = f"[{np.min(best_thetas):.3f}, {np.max(best_thetas):.3f}]"
+            top_theta = np.max(best_thetas)
+            print(f"{i:<10} {avg_theta:<15.3f} {theta_range:<20} {top_theta:<15.3f}")
+        
+        # Show value-dependent strategies for all agents
+        print("\n" + "-" * 80)
+        print("Value-Dependent Strategies (All Agents):")
+        for i in range(n_agents):
+            print(f"\nAgent {i}:")
+            print(f"  Low values (0.0-0.3):  theta ≈ {np.mean(strategies[i]['best_theta_per_state'][:3]):.3f}")
+            print(f"  Mid values (0.4-0.6):  theta ≈ {np.mean(strategies[i]['best_theta_per_state'][4:7]):.3f}")
+            print(f"  High values (0.7-1.0): theta ≈ {np.mean(strategies[i]['best_theta_per_state'][7:]):.3f}")
+    
+    elif agent_type == "regret_matching":
+        print("\nRegretMatching Agents:")
+        print(f"{'Agent':<10} {'Expected Theta':<20} {'Top 3 Thetas':<50}")
+        print("-" * 80)
+        
+        for i in range(n_agents):
+            expected = strategies[i]['expected_theta']
+            top_thetas = strategies[i]['top_thetas'][:3]
+            top_str = ", ".join([f"θ={t['theta']:.3f}({t['probability']:.2f})" 
+                                for t in top_thetas])
+            print(f"{i:<10} {expected:<20.3f} {top_str:<50}")
+        
+        # Show strategy concentration for all agents
+        print("\n" + "-" * 80)
+        print("Strategy Concentration (Top 5 Thetas - All Agents):")
+        print("Note: With 500 theta options, uniform distribution = 1/500 = 0.0020 per theta")
+        print("Higher probabilities indicate more concentrated strategies.\n")
+        
+        for i in range(n_agents):
+            strategy = strategies[i]['strategy']
+            top_thetas = strategies[i]['top_thetas']
+            expected = strategies[i]['expected_theta']
+            theta_opts = strategies[i]['theta_options']
+            
+            # Calculate concentration metrics
+            top5_prob_sum = sum([t['probability'] for t in top_thetas[:5]])
+            entropy = -np.sum(strategy * np.log(strategy + 1e-10))  # Strategy entropy
+            max_entropy = np.log(len(strategy))  # Maximum entropy (uniform)
+            concentration = 1 - (entropy / max_entropy)  # 0 = uniform, 1 = concentrated
+            
+            # Show probability mass in different theta ranges
+            low_range = np.sum(strategy[(theta_opts >= 0.0) & (theta_opts < 0.4)])
+            mid_range = np.sum(strategy[(theta_opts >= 0.4) & (theta_opts < 0.7)])
+            high_range = np.sum(strategy[(theta_opts >= 0.7) & (theta_opts <= 1.0)])
+            
+            print(f"\nAgent {i}:")
+            print(f"  Expected theta: {expected:.3f}")
+            print(f"  Top 5 thetas total probability: {top5_prob_sum:.4f} ({top5_prob_sum*100:.1f}%)")
+            print(f"  Strategy concentration: {concentration:.4f} (0=uniform, 1=concentrated)")
+            print(f"  Probability mass: Low[0.0-0.4)={low_range:.3f}, Mid[0.4-0.7)={mid_range:.3f}, High[0.7-1.0]={high_range:.3f}")
+            print("  (If uniform: each range ≈ 0.33)")
+            
+            for j, top in enumerate(top_thetas[:5], 1):
+                print(f"  {j}. θ={top['theta']:.3f}: prob={top['probability']:.4f}")
+    
+    print("\n" + "=" * 80)
+
+
 if __name__ == "__main__":
     # Test the AMD implementation
     n_agents = 10
-    n_rounds = 20000  # More rounds for convergence
+    n_rounds = 30000  # More rounds for convergence
     theta_options = np.linspace(0.0, 1.0, 1000)
     
     # Create graphs directory if it doesn't exist
@@ -687,6 +977,21 @@ if __name__ == "__main__":
     
     # Plot convergence
     plot_amd_convergence(metrics, n_agents, save_path='graphs/amd_convergence.png')
+    
+    # Extract and visualize strategies
+    print("\n" + "=" * 60)
+    print("Analyzing Learned Strategies...")
+    print("=" * 60)
+    
+    # Get agent type from metrics or use default
+    agent_type_used = metrics.get('agent_type', "regret_matching")
+    
+    # Print strategy summary
+    print_strategy_summary(agents, agent_type=agent_type_used, n_agents=n_agents)
+    
+    # Plot strategy visualizations
+    plot_agent_strategies(agents, agent_type=agent_type_used, n_agents=n_agents,
+                         save_path='graphs/agent_strategies.png')
     
     print("\n" + "=" * 60)
     print("Simulation Complete!")
