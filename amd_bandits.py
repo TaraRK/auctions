@@ -120,12 +120,12 @@ class PaymentNetwork(nn.Module):
         # Initialize final layer to output payments closer to bids initially
         # This helps the network start in a reasonable range instead of near zero
         with torch.no_grad():
-            # Initialize final layer bias to ~0.0 (let network learn from scratch)
-            # This prevents anchoring payments at a fixed value
+            # Initialize final layer bias to ~0.2 (reasonable initial payment for avg bid ~0.2-0.3)
+            # This gives the network a reasonable starting point while still allowing learning
             if hasattr(self.net[-1], 'bias') and self.net[-1].bias is not None:
-                self.net[-1].bias.fill_(0.0)  # Start at zero, let learning determine optimal payments
-            # Scale down weights so initial outputs are small but learnable
-            self.net[-1].weight.data *= 0.01  # Smaller initial weights for more gradual learning
+                self.net[-1].bias.fill_(0.2)  # Start at reasonable value, network can learn to adjust
+            # Use moderate initial weights to allow learning in both directions
+            self.net[-1].weight.data *= 0.1  # Moderate initial weights for balanced learning
     
     def forward(self, bids: torch.Tensor, winner_idx: int, allocation: torch.Tensor) -> torch.Tensor:
         """
@@ -222,7 +222,14 @@ class LearningAuctioneer:
         lr: float = 1e-3,
         hidden_dim: int = 64,
         allocation_temperature: float = 1.0,
-        max_payment_multiplier: float = None  
+        max_payment_multiplier: float = None,
+        gamma: float = 0.99,
+        gae_lambda: float = 0.95,
+        clip_coef: float = 0.2,
+        ent_coef: float = 0.01,
+        vf_coef: float = 0.5,
+        update_epochs: int = 4,
+        buffer_size: int = 100  # Match training_interval so updates happen naturally during each phase
     ):
         self.n_agents = n_agents
         self.allocation_temperature = allocation_temperature
@@ -230,8 +237,28 @@ class LearningAuctioneer:
         self.G_network = AllocationNetwork(n_agents, hidden_dim)
         self.P_network = PaymentNetwork(n_agents, hidden_dim, max_payment_multiplier=max_payment_multiplier)
         
+        # Value network (critic) to estimate expected revenue given bids
+        self.value_network = nn.Sequential(
+            nn.Linear(n_agents, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+        
+        # PPO hyperparameters
+        self.gamma = gamma
+        self.gae_lambda = gae_lambda
+        self.clip_coef = clip_coef
+        self.ent_coef = ent_coef
+        self.vf_coef = vf_coef
+        self.update_epochs = update_epochs
+        self.buffer_size = buffer_size
+        
         self.optimizer = optim.Adam(
-            list(self.G_network.parameters()) + list(self.P_network.parameters()),
+            list(self.G_network.parameters()) + 
+            list(self.P_network.parameters()) + 
+            list(self.value_network.parameters()),
             lr=lr
         )
         
@@ -239,6 +266,16 @@ class LearningAuctioneer:
             'revenue': [],
             'regret': [],
             'efficiency': []
+        }
+        
+        # Experience buffer for PPO
+        self.buffer = {
+            'bids': [],
+            'allocation_probs': [],
+            'allocation_log_probs': [],
+            'payments': [],
+            'revenues': [],
+            'values': []  # Value network estimates
         }
     
     def run_auction(
@@ -267,11 +304,20 @@ class LearningAuctioneer:
         utilities = np.zeros(self.n_agents)
         utilities[winner_idx] = values[winner_idx] - payments[winner_idx]
         
-       
-        revenue = payments[winner_idx] 
+        revenue = payments[winner_idx]
         
+        # Compute value estimate and allocation log probs for PPO
+        bids_tensor = torch.FloatTensor(bids).unsqueeze(0)
+        with torch.no_grad():
+            value_estimate = self.value_network(bids_tensor).item()
+            logits = self.G_network.forward(bids_tensor)
+            allocation_log_probs_tensor = torch.log_softmax(logits / self.allocation_temperature, dim=-1)
+            # Sum over agents to get total log prob (for PPO)
+            allocation_log_prob_sum = torch.sum(allocation_log_probs_tensor * torch.FloatTensor(allocation_probs).unsqueeze(0), dim=-1).item()
+        
+        # Collect experience for PPO
         if hasattr(self, 'collect_experience'):
-            self.collect_experience(bids, allocation_probs, payments, revenue, values)
+            self.collect_experience(bids, allocation_probs, allocation_log_prob_sum, payments, revenue, value_estimate)
         
         agent_info = self._reveal_information(bids, values, winner_idx, payments, info_type)
         
@@ -360,116 +406,132 @@ class LearningAuctioneer:
         return agent_info
     
     def collect_experience(self, bids: np.ndarray, allocation_probs: np.ndarray, 
-                          payments: np.ndarray, revenue: float, values: np.ndarray = None):
+                          allocation_log_prob_sum: float, payments: np.ndarray, 
+                          revenue: float, value_estimate: float):
         """
-        Collect experience for training (REINFORCE)
+        Collect experience for PPO-style training
         
         Args:
             bids: Bids from agents
             allocation_probs: Allocation probabilities from G network
+            allocation_log_probs: Log probabilities of allocation (for PPO)
             payments: Payments from P network
-            revenue: Revenue from this auction
-            values: Agent values (for individual rationality constraint)
+            revenue: Revenue from this auction (reward)
+            value_estimate: Value network estimate of expected revenue
         """
-        if not hasattr(self, 'experience_buffer'):
-            self.experience_buffer = []
-        
-        # Track average bid level to see if bids are decreasing over time
-        avg_bid = np.mean(bids)
-        max_bid = np.max(bids)
-        
-        self.experience_buffer.append({
-            'bids': bids.copy(),
-            'allocation_probs': allocation_probs.copy(),
-            'payments': payments.copy(),
-            'revenue': revenue,
-            'avg_bid': avg_bid,
-            'max_bid': max_bid,
-            'values': values.copy() if values is not None else None
-        })
+        self.buffer['bids'].append(bids.copy())
+        self.buffer['allocation_probs'].append(allocation_probs.copy())
+        self.buffer['allocation_log_probs'].append(allocation_log_prob_sum)
+        self.buffer['payments'].append(payments.copy())
+        self.buffer['revenues'].append(revenue)
+        self.buffer['values'].append(value_estimate)
         
         self.history['revenue'].append(revenue)
     
-    def train_step(self, baseline: float = None):
+    def update_step(self, force_update: bool = False):
         """
-        Perform REINFORCE training step to maximize revenue
+        Perform PPO-style update step (called every round)
+        Updates when buffer is full or when forced (e.g., at end of phase)
+        """
+        if len(self.buffer['bids']) < self.buffer_size and not force_update:
+            return 0.0
         
-        Args:
-            baseline: Baseline revenue for variance reduction (optional)
-        """
-        if not hasattr(self, 'experience_buffer') or len(self.experience_buffer) == 0:
-            return
+        # If forcing update with small buffer, need at least 1 experience
+        if len(self.buffer['bids']) == 0:
+            return 0.0
         
         # Set networks to training mode
         self.G_network.train()
         self.P_network.train()
+        self.value_network.train()
         
-        # Compute baseline if not provided
-        if baseline is None:
-            baseline = np.mean([exp['revenue'] for exp in self.experience_buffer])
+        # Convert buffer to tensors
+        bids_tensor = torch.FloatTensor(np.array(self.buffer['bids']))  # [T, n_agents]
+        allocation_probs_tensor = torch.FloatTensor(np.array(self.buffer['allocation_probs']))  # [T, n_agents]
+        old_allocation_log_probs = torch.FloatTensor(self.buffer['allocation_log_probs'])  # [T]
+        revenues = torch.FloatTensor(self.buffer['revenues'])  # [T]
         
+        # Compute advantages using GAE
+        with torch.no_grad():
+            # Get value estimates for all states
+            current_values = self.value_network(bids_tensor).squeeze()  # [T]
+            
+            # Compute advantages using GAE
+            advantages = torch.zeros_like(revenues)
+            lastgaelam = 0.0
+            for t in reversed(range(len(revenues))):
+                if t == len(revenues) - 1:
+                    next_value = 0.0  # Terminal state
+                else:
+                    next_value = current_values[t + 1]
+                delta = revenues[t] + self.gamma * next_value - current_values[t]
+                lastgaelam = delta + self.gamma * self.gae_lambda * lastgaelam
+                advantages[t] = lastgaelam
+            returns = advantages + current_values
+        
+        # Standardize advantages
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        # PPO update epochs
         total_loss = 0.0
+        for epoch in range(self.update_epochs):
+            # Recompute log probs with current policy
+            logits = self.G_network.forward(bids_tensor)  # [T, n_agents]
+            new_allocation_log_probs = torch.log_softmax(logits / self.allocation_temperature, dim=-1)
+            
+            # Get winner indices and payments
+            winner_indices = torch.argmax(allocation_probs_tensor, dim=-1)  # [T]
+            payments_tensor = []
+            for t in range(len(bids_tensor)):
+                winner_idx = int(winner_indices[t].item())
+                payment = self.P_network.forward(bids_tensor[t:t+1], winner_idx, allocation_probs_tensor[t:t+1])
+                payments_tensor.append(payment[0, winner_idx])
+            payments_tensor = torch.stack(payments_tensor)  # [T]
+            
+            # Allocation loss (PPO clipped)
+            # Sum over agents to get total allocation log prob
+            allocation_log_prob_sum = torch.sum(new_allocation_log_probs * allocation_probs_tensor, dim=-1)  # [T]
+            old_allocation_log_prob_sum = old_allocation_log_probs  # [T]
+            
+            ratio = (allocation_log_prob_sum - old_allocation_log_prob_sum).exp()
+            pg_loss1 = -advantages * ratio
+            pg_loss2 = -advantages * ratio.clamp(1.0 - self.clip_coef, 1.0 + self.clip_coef)
+            allocation_loss = torch.max(pg_loss1, pg_loss2).mean()
+            
+            # Payment loss (simplified - maximize payment when advantage > 0)
+            # This is a simplified version - in full PPO we'd track payment log probs too
+            payment_loss = -torch.mean(payments_tensor * advantages)
+            
+            # Value loss
+            new_values = self.value_network(bids_tensor).squeeze()  # [T]
+            value_loss = 0.5 * ((new_values - returns) ** 2).mean()
+            
+            # Entropy bonus (encourage exploration in allocation)
+            entropy = -torch.sum(allocation_probs_tensor * new_allocation_log_probs, dim=-1).mean()
+            
+            loss = allocation_loss + payment_loss + self.vf_coef * value_loss - self.ent_coef * entropy
+            total_loss += loss.item()
+            
+            # Backward pass
+            self.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(self.G_network.parameters()) + 
+                list(self.P_network.parameters()) + 
+                list(self.value_network.parameters()),
+                max_norm=1.0
+            )
+            self.optimizer.step()
         
-        for exp in self.experience_buffer:
-            bids = torch.FloatTensor(exp['bids']).unsqueeze(0)
-            allocation_probs = torch.FloatTensor(exp['allocation_probs']).unsqueeze(0)
-            revenue = exp['revenue']
-            
-            # Forward pass through G network
-            logits = self.G_network.forward(bids)
-            allocation_log_probs = torch.log_softmax(logits / self.allocation_temperature, dim=-1)
-            
-            # Forward pass through P network (need winner for this)
-            winner_idx = int(torch.argmax(allocation_probs, dim=-1).item())
-            payments_tensor = self.P_network.forward(bids, winner_idx, allocation_probs)
-            
-            # REINFORCE loss: -log_prob * (reward - baseline)
-            # Reward: raw revenue
-            # The feedback loop works naturally:
-            # - High payments → agents bid lower (in next phase) → revenue decreases (in next training)
-            # - Network sees lower revenue when it trains next → learns to charge less
-            # - No explicit penalties needed - the natural feedback loop should work
-            advantage = revenue - baseline
-            
-            # Loss from allocation: weighted by allocation probability
-            allocation_loss = -torch.sum(allocation_log_probs * allocation_probs) * advantage
-            
-            # ============================================================
-            # PAYMENT LOSS: Learn from feedback loop
-            # The network should learn: high payments → lower bids → lower future revenue
-            # We use the actual revenue as reward - if payments are too high, 
-            # agents will bid lower in next phase, reducing revenue, and network learns
-            # ============================================================
-            winner_payment = payments_tensor[0, winner_idx]
-            
-            # Simple REINFORCE: maximize revenue
-            # The feedback loop works because:
-            # - High payments → agents bid lower → future revenue decreases
-            # - Network sees lower revenue in next training phase → learns to charge less
-            # - This creates natural learning without explicit penalties
-            payment_loss = -winner_payment * advantage
-            
-            loss = allocation_loss + payment_loss
-            total_loss += loss
-        
-        # Average loss
-        avg_loss = total_loss / len(self.experience_buffer)
-        
-        # Backward pass
-        self.optimizer.zero_grad()
-        avg_loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            list(self.G_network.parameters()) + list(self.P_network.parameters()),
-            max_norm=1.0
-        )
-        self.optimizer.step()
+        # Clear buffer
+        for k in self.buffer:
+            self.buffer[k] = []
         
         self.G_network.eval()
         self.P_network.eval()
+        self.value_network.eval()
         
-        self.experience_buffer = []
-        
-        return avg_loss.item()
+        return total_loss / self.update_epochs
 
 
 def run_amd_simulation(
@@ -478,10 +540,10 @@ def run_amd_simulation(
     info_type: InformationType = InformationType.MINIMAL,
     agent_type: str = "ppo",  # "ucb", "epsilon_greedy", "regret_matching", or "ppo"
     theta_options: np.ndarray = None,
-    lr_auctioneer: float = 1e-3,
+    lr_auctioneer: float = 5e-4,  # Reduced from 1e-3 to stabilize learning and prevent runaway revenue
     allocation_temperature: float = 1.0,
     alternate_training: bool = True,
-    training_interval: int = 50
+    training_interval: int = 100
 ):
     """
     Run AMD simulation with learning agents and learning auctioneer
@@ -546,15 +608,23 @@ def run_amd_simulation(
     strategy_concentration_hist = []  # Track strategy concentration over time
     strategy_entropy_hist = []  # Track strategy entropy over time
     
-    train_agents = True  
-    auctioneer.experience_buffer = []
+    # Initialize buffer (no need for old experience_buffer)
     
     for round_idx in range(n_rounds):
+        # Alternating training: one side learns, other is frozen
+        # But both can update every round (not batched) when it's their turn
         if alternate_training:
             phase = (round_idx // training_interval) % 2
             train_agents = (phase == 0)
+            
+            # Clear auctioneer buffer when switching to auctioneer phase
+            # This ensures auctioneer starts fresh for its learning phase
+            if round_idx > 0 and round_idx % training_interval == 0 and not train_agents:
+                # Switching to auctioneer phase - clear buffer to start fresh
+                for k in auctioneer.buffer:
+                    auctioneer.buffer[k] = []
         else:
-            train_agents = True 
+            train_agents = True  # Both learn if not alternating
         
         values = np.array([agent.draw_value() for agent in agents])
         thetas = [agent.choose_theta() for agent in agents]
@@ -576,6 +646,7 @@ def run_amd_simulation(
             agent_info=outcome.agent_info
         )
         
+        # Update agents (if it's their phase)
         if train_agents:
             for i, agent in enumerate(agents):
                 # For regret matching in AMD: pass auctioneer to compute counterfactual payments
@@ -584,29 +655,24 @@ def run_amd_simulation(
                 else:
                     # PPO and bandit agents use standard update
                     agent.update(values[i], thetas[i], agent_outcome)
-        else:
-            pass
         
+        # Update auctioneer (if it's their phase, PPO-style updates when buffer is full)
         if not train_agents:
-            should_train = (round_idx % training_interval == 0) or (len(auctioneer.experience_buffer) >= training_interval)
-            if should_train and len(auctioneer.experience_buffer) > 0:
-                # Debug: Check what network is learning
-                if round_idx % 5000 == 0:
-                    avg_bid_in_buffer = np.mean([np.mean(exp['bids']) for exp in auctioneer.experience_buffer])
-                    max_bid_in_buffer = np.mean([np.max(exp['bids']) for exp in auctioneer.experience_buffer])
-                    avg_payment_in_buffer = np.mean([exp['payments'][exp['winner_idx']] for exp in auctioneer.experience_buffer])
-                    avg_revenue_in_buffer = np.mean([exp['revenue'] for exp in auctioneer.experience_buffer])
-                    payment_ratio = avg_payment_in_buffer / avg_bid_in_buffer if avg_bid_in_buffer > 0 else 0
-                    print(f"  [Auctioneer Training @ Round {round_idx}]")
-                    print(f"    Avg bid in buffer: {avg_bid_in_buffer:.4f}, Max bid: {max_bid_in_buffer:.4f}")
-                    print(f"    Avg payment in buffer: {avg_payment_in_buffer:.4f}")
-                    print(f"    Payment/Bid ratio: {payment_ratio:.2f}x")
-                    print(f"    Avg revenue in buffer: {avg_revenue_in_buffer:.4f}")
-                    print(f"    Buffer size: {len(auctioneer.experience_buffer)}")
-                
-                loss = auctioneer.train_step()
+            # Force update at end of phase if buffer has experiences but isn't full
+            # This ensures auctioneer learns even if buffer_size > training_interval
+            force_update = (round_idx % training_interval == training_interval - 1) and len(auctioneer.buffer['bids']) > 0
+            loss = auctioneer.update_step(force_update=force_update)
+            if loss > 0:
                 auctioneer_loss_hist.append(loss)
         
+        # Debug output at intervals (for stability monitoring)
+        if round_idx % training_interval == 0 and round_idx > 0:
+            if len(auctioneer.buffer['revenues']) > 0:
+                avg_revenue = np.mean(auctioneer.buffer['revenues'])
+                avg_bid = np.mean([np.mean(b) for b in auctioneer.buffer['bids']]) if len(auctioneer.buffer['bids']) > 0 else 0.0
+                print(f"  [Round {round_idx}] Avg revenue: {avg_revenue:.4f}, Avg bid: {avg_bid:.4f}, Buffer size: {len(auctioneer.buffer['bids'])}")
+        
+        # Track phase for visualization
         training_phase_hist.append(1 if train_agents else 0)
         
         for i in range(n_agents):
@@ -969,6 +1035,55 @@ def plot_agent_strategies(agents, agent_type: str, n_agents: int,
         plt.savefig(save_path, dpi=150)
         print(f"Strategy distributions saved to {save_path}")
         plt.close()
+    
+    elif agent_type == "ppo":
+        # PPO strategies: Show theta distribution over time and current values
+        fig, axes = plt.subplots(2, (n_agents + 1) // 2, figsize=(15, 10))
+        if n_agents == 1:
+            axes = [axes]
+        else:
+            axes = axes.flatten()
+        
+        for i, agent in enumerate(agents):
+            ax = axes[i]
+            mean_theta = strategies[i]['mean_theta']
+            current_theta = strategies[i]['current_theta']
+            
+            # Extract theta history if available
+            if hasattr(agent, 'history') and len(agent.history) > 0:
+                thetas = [h[3] for h in agent.history]  # theta is index 3
+                # Plot histogram of theta values
+                ax.hist(thetas, bins=30, alpha=0.7, edgecolor='black')
+                ax.axvline(x=mean_theta, color='r', linestyle='--', linewidth=2,
+                          label=f'Mean: {mean_theta:.3f}')
+                ax.axvline(x=current_theta, color='g', linestyle='--', linewidth=2,
+                          label=f'Current: {current_theta:.3f}')
+                ax.axvline(x=(n_agents-1)/n_agents, color='orange', linestyle='--', 
+                          label=f'Theory: {(n_agents-1)/n_agents:.3f}')
+                ax.set_xlabel('Theta')
+                ax.set_ylabel('Frequency')
+                ax.set_title(f'Agent {i} Theta Distribution\n(Mean: {mean_theta:.3f}, Current: {current_theta:.3f})')
+            else:
+                # If no history, just show current theta
+                ax.barh(0, current_theta, height=0.5, alpha=0.7, label=f'Current: {current_theta:.3f}')
+                ax.axvline(x=(n_agents-1)/n_agents, color='orange', linestyle='--', 
+                          label=f'Theory: {(n_agents-1)/n_agents:.3f}')
+                ax.set_xlabel('Theta')
+                ax.set_ylabel('')
+                ax.set_title(f'Agent {i} Current Theta: {current_theta:.3f}')
+                ax.set_ylim(-0.5, 0.5)
+            
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+        
+        # Hide unused subplots
+        for i in range(n_agents, len(axes)):
+            axes[i].axis('off')
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150)
+        print(f"PPO strategy distributions saved to {save_path}")
+        plt.close()
 
 
 def print_strategy_summary(agents, agent_type: str, n_agents: int):
@@ -1006,6 +1121,25 @@ def print_strategy_summary(agents, agent_type: str, n_agents: int):
             print(f"  Low values (0.0-0.3):  theta ≈ {np.mean(strategies[i]['best_theta_per_state'][:3]):.3f}")
             print(f"  Mid values (0.4-0.6):  theta ≈ {np.mean(strategies[i]['best_theta_per_state'][4:7]):.3f}")
             print(f"  High values (0.7-1.0): theta ≈ {np.mean(strategies[i]['best_theta_per_state'][7:]):.3f}")
+    
+    elif agent_type == "ppo":
+        print("\nPPO Agents:")
+        print(f"{'Agent':<10} {'Mean Theta (last 100)':<25} {'Current Theta':<20}")
+        print("-" * 80)
+        
+        for i in range(n_agents):
+            mean_theta = strategies[i]['mean_theta']
+            current_theta = strategies[i]['current_theta']
+            print(f"{i:<10} {mean_theta:<25.3f} {current_theta:<20.3f}")
+        
+        # Show theta statistics
+        print("\n" + "-" * 80)
+        print("PPO Strategy Statistics:")
+        mean_thetas = [strategies[i]['mean_theta'] for i in range(n_agents)]
+        current_thetas = [strategies[i]['current_theta'] for i in range(n_agents)]
+        print(f"  Mean theta across agents: {np.mean(mean_thetas):.3f} ± {np.std(mean_thetas):.3f}")
+        print(f"  Current theta across agents: {np.mean(current_thetas):.3f} ± {np.std(current_thetas):.3f}")
+        print(f"  Theta range: [{np.min(current_thetas):.3f}, {np.max(current_thetas):.3f}]")
     
     elif agent_type == "regret_matching":
         print("\nRegretMatching Agents:")
@@ -1069,7 +1203,7 @@ if __name__ == "__main__":
     print("=" * 60)
     print(f"Agents: {n_agents}")
     print(f"Rounds: {n_rounds}")
-    print("Alternating training: Every 50 rounds")
+    print("Alternating training: Every 100 rounds")
     print("="*60)
     
     # Test with RegretMatching agents (uses revealed information)
@@ -1080,7 +1214,7 @@ if __name__ == "__main__":
         agent_type="ppo",  # Use PPO (much faster than regret matching)
         theta_options=None,  # Not needed for RegretMatching
         alternate_training=True,
-        training_interval=50
+        training_interval=100
     )
     
     print("\n" + "=" * 60)
@@ -1088,7 +1222,7 @@ if __name__ == "__main__":
     print("=" * 60)
     
     # Plot convergence
-    plot_amd_convergence(metrics, n_agents, save_path='graphs/amd_convergence.png')
+    plot_amd_convergence(metrics, n_agents, save_path='graphs/amd_convergence_no_scaling.png')
     
     # Extract and visualize strategies
     print("\n" + "=" * 60)
@@ -1103,7 +1237,7 @@ if __name__ == "__main__":
     
     # Plot strategy visualizations
     plot_agent_strategies(agents, agent_type=agent_type_used, n_agents=n_agents,
-                         save_path='graphs/agent_strategies.png')
+                         save_path='graphs/agent_strategies_no_scaling.png')
     
     print("\n" + "=" * 60)
     print("Simulation Complete!")
