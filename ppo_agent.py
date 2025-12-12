@@ -224,7 +224,9 @@ class PPOAgent(Agent):
 
         # critic values at states (fixed for GAE computation)
         with torch.no_grad():
-            values = self.critic(states).squeeze()                                    # [T]
+            value_output = self.critic(states)  # [T, 1]
+            # Squeeze only the last dimension to keep batch dimension (handle single sample case)
+            values = value_output.squeeze(-1)  # [T] - always 1D even if T=1
             advantages = torch.zeros_like(rewards)
             lastgaelam = 0.0
             for t in reversed(range(len(rewards))):
@@ -249,7 +251,7 @@ class PPOAgent(Agent):
             # entropy of base gaussian is fine for a signal (exact transformed entropy is messy)
             entropy = dist.base_dist.entropy().sum(dim=1).mean()
 
-            new_values = self.critic(states).squeeze()
+            new_values = self.critic(states).squeeze(-1)  # [T] - squeeze last dim only
 
             ratio = (new_logprobs - old_logprobs).exp()
             pg_loss1 = -advantages * ratio
