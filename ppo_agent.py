@@ -205,6 +205,23 @@ class PPOAgent(Agent):
         rewards = torch.tensor(self.buffer["rewards"], dtype=torch.float32)           # [T]
         dones = torch.tensor(self.buffer["dones"], dtype=torch.float32)               # [T]
 
+        # Check for NaN/inf in inputs
+        if torch.isnan(states).any() or torch.isinf(states).any():
+            print(f"Agent {self.agent_id}: NaN/inf in states, skipping update")
+            return
+        if torch.isnan(rewards).any() or torch.isinf(rewards).any():
+            print(f"Agent {self.agent_id}: NaN/inf in rewards, skipping update")
+            return
+        if torch.isnan(old_logprobs).any() or torch.isinf(old_logprobs).any():
+            print(f"Agent {self.agent_id}: NaN/inf in old_logprobs, skipping update")
+            return
+
+        # Check network weights before update
+        for name, param in self.actor_mean.named_parameters():
+            if torch.isnan(param).any() or torch.isinf(param).any():
+                print(f"Agent {self.agent_id}: NaN/inf in {name} BEFORE update")
+                return
+
         # critic values at states (fixed for GAE computation)
         with torch.no_grad():
             values = self.critic(states).squeeze()                                    # [T]
