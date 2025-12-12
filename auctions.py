@@ -73,12 +73,78 @@ class AllPayAuction:
     def run_auction(self, values: np.ndarray, bids: np.ndarray) -> AuctionOutcome:
         winner_idx = np.argmax(bids)
         winning_bid = bids[winner_idx]
-        
+
         payments = bids
         # utilities = np.zeros(self.n_agents)
-    
-        utilities = values - payments 
+
+        utilities = values - payments
         # utilities[winner_idx] = values[winner_idx] - payments[winner_idx]
+
+        return AuctionOutcome(
+            winner_idx=winner_idx,
+            winning_bid=winning_bid,
+            all_bids=bids.copy(),
+            payments=payments,
+            utilities=utilities,
+        )
+
+class WarOfAttritionAuction:
+    """
+    War of Attrition Auction (Krishna & Morgan, 1997)
+
+    Mechanism:
+    - All agents submit bids (representing "time willing to fight")
+    - Highest bidder wins the item
+    - Payment rule: Each agent pays for the TIME they stayed in the game
+      * If you drop out early (bid < 2nd-highest): pay your own bid
+      * If you stay until the end (bid >= 2nd-highest): pay the 2nd-highest bid
+      * Equivalent to: pay = min(own_bid, second_highest_bid)
+
+    Payoffs:
+    - Winner: value - second_highest_bid (stayed until end)
+    - Losers who bid low: -own_bid (dropped out early)
+    - Losers who bid high: -second_highest_bid (stayed until game ended)
+
+    Strategic implications:
+    - Creates proper incentives: dropping out early costs less
+    - Different from all-pay auction (where you always pay your full bid)
+    - Equilibrium typically involves mixed strategies
+
+    Reference: Krishna, V., & Morgan, J. (1997). "An Analysis of the War of Attrition
+    and the All-Pay Auction." Journal of Economic Theory, 72(2), 343-362.
+    """
+    def __init__(self, n_agents: int):
+        self.n_agents = n_agents
+
+    def run_auction(self, values: np.ndarray, bids: np.ndarray) -> AuctionOutcome:
+        """
+        Run a war of attrition auction.
+
+        Args:
+            values: Private values of agents
+            bids: Bids submitted by agents (representing time/effort willing to expend)
+
+        Returns:
+            AuctionOutcome with winner, payments, and utilities
+        """
+        # Highest bidder wins
+        winner_idx = np.argmax(bids)
+        winning_bid = bids[winner_idx]
+
+        # Second-highest bid (when game ends - second-to-last player drops out)
+        second_highest_bid = np.sort(bids)[-2] if self.n_agents > 1 else bids[winner_idx]
+
+        # Payment rule: Each agent pays for the TIME they stayed in
+        # - If you dropped out before game ended (bid < second_highest): pay your own bid
+        # - If you stayed until game ended (bid >= second_highest): pay second_highest_bid
+        # This is equivalent to: pay min(your_bid, second_highest_bid)
+        payments = np.minimum(bids, second_highest_bid)
+
+        # Utilities:
+        # - Winner gets value minus payment
+        # - All losers pay their payment (negative utility)
+        utilities = -payments  # Everyone pays for time they stayed in
+        utilities[winner_idx] = values[winner_idx] - payments[winner_idx]  # Winner also gets value
 
         return AuctionOutcome(
             winner_idx=winner_idx,
@@ -276,5 +342,7 @@ def run_simulation(n_agents: int, n_rounds: int):
     return agents
 
 # test
-agents = run_simulation(n_agents=10, n_rounds=1000)
+# Commented out to prevent execution on import
+# Uncomment if you want to run the simulation directly
+# agents = run_simulation(n_agents=10, n_rounds=1000)
 
