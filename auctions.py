@@ -311,6 +311,12 @@ def run_gamma_sweep(gamma_values, n_agents=10, n_rounds=1000, n_trials=3):
         'theta_std': []
     }
     
+    # Write CSV header
+    csv_filename = 'gamma_sweep_results.csv'
+    with open(csv_filename, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['gamma', 'theta_mean', 'theta_std'])
+    
     for gamma in gamma_values:
         print(f"Running experiments for gamma = {gamma}...")
         theta_values = []
@@ -318,7 +324,7 @@ def run_gamma_sweep(gamma_values, n_agents=10, n_rounds=1000, n_trials=3):
         # Run multiple trials for this gamma
         for trial in range(n_trials):
             print(f"  Trial {trial + 1}/{n_trials}")
-            avg_theta = run_simulation(
+            agents, avg_theta = run_simulation(
                 n_agents=n_agents, 
                 n_rounds=n_rounds, 
                 gamma=gamma
@@ -326,14 +332,17 @@ def run_gamma_sweep(gamma_values, n_agents=10, n_rounds=1000, n_trials=3):
             theta_values.append(avg_theta)
         
         # Store results
+        gamma_mean = np.mean(theta_values)
+        gamma_std = np.std(theta_values)
+        
         results['gamma'].append(gamma)
-        results['theta_mean'].append(np.mean(theta_values))
-        results['theta_std'].append(np.std(theta_values))
-    
-    csv_filename = 'gamma_sweep_results.csv'
-    with open(csv_filename, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['gamma', 'theta_mean', 'theta_std'])
+        results['theta_mean'].append(gamma_mean)
+        results['theta_std'].append(gamma_std)
+        
+        # Append to CSV after each gamma
+        with open(csv_filename, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([gamma, gamma_mean, gamma_std])
     
     return results
 
