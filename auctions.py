@@ -5,6 +5,8 @@ from matplotlib import pyplot as plt
 from regret_matching import RegretMatchingAgent
 from q_learning import QLearningAgent
 from ppo_agent import PPOAgent
+import csv
+import time
 
 @dataclass
 # class AuctionOutcome:
@@ -172,8 +174,9 @@ def plot_results(n_agents, theta_hist, avg_theta_hist, efficiency_hist, revenue_
     ax.legend()
 
     plt.tight_layout()
-    plt.savefig('auction_learning.png', dpi=150)
-    plt.show()
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    plt.savefig(f'auction_learning_{timestamp}.png', dpi=150)
+    # plt.show()
 
     # console summary
     print(f"\nfinal results (n={n_agents}):")
@@ -184,7 +187,7 @@ def plot_results(n_agents, theta_hist, avg_theta_hist, efficiency_hist, revenue_
 
 
 # usage
-def run_simulation(n_agents: int, n_rounds: int):
+def run_simulation(n_agents: int, n_rounds: int, gamma: float):
     auction = FirstPriceAuction(n_agents)
     # agents = [Agent(i) for i in range(n_agents)]
     # agents = [QLearningAgent(i) for i in range(n_agents)]
@@ -193,7 +196,8 @@ def run_simulation(n_agents: int, n_rounds: int):
     agents = [PPOAgent(
         i, 
         initial_budget=100.0,  # budget for one episode
-        total_auctions=auctions_per_episode
+        total_auctions=auctions_per_episode,
+        gamma=gamma
     ) for i in range(n_agents)]
     
     # tracking for plots
@@ -273,8 +277,119 @@ def run_simulation(n_agents: int, n_rounds: int):
     # plot results
     plot_results(n_agents, theta_hist, avg_theta_hist, efficiency_hist, revenue_hist)
     
-    return agents
+    last_avg_theta = avg_theta_hist[-1]
+    return agents, last_avg_theta
 
 # test
-agents = run_simulation(n_agents=10, n_rounds=1000)
 
+# last_avg_theta = run_simulation(n_agents=10, n_rounds=1000)
+
+
+def run_gamma_sweep(gamma_values, n_agents=10, n_rounds=1000, n_trials=3):
+    """
+    Run collusion experiments across different gamma values.
+    
+    Parameters:
+    -----------
+    gamma_values : list or array
+        List of discount factors to test
+    n_agents : int
+        Number of agents in the auction
+    n_rounds : int
+        Number of auction rounds
+    n_trials : int
+        Number of trials per gamma value
+        
+    Returns:
+    --------
+    results : dict
+        Dictionary containing gamma values, mean theta, and std theta
+    """
+    results = {
+        'gamma': [],
+        'theta_mean': [],
+        'theta_std': []
+    }
+    
+    for gamma in gamma_values:
+        print(f"Running experiments for gamma = {gamma}...")
+        theta_values = []
+        
+        # Run multiple trials for this gamma
+        for trial in range(n_trials):
+            print(f"  Trial {trial + 1}/{n_trials}")
+            avg_theta = run_simulation(
+                n_agents=n_agents, 
+                n_rounds=n_rounds, 
+                gamma=gamma
+            )
+            theta_values.append(avg_theta)
+        
+        # Store results
+        results['gamma'].append(gamma)
+        results['theta_mean'].append(np.mean(theta_values))
+        results['theta_std'].append(np.std(theta_values))
+    
+    csv_filename = 'gamma_sweep_results.csv'
+    with open(csv_filename, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['gamma', 'theta_mean', 'theta_std'])
+    
+    return results
+
+
+def plot_gamma_vs_theta(results):
+    """
+    Plot the relationship between gamma and converged theta values.
+    
+    Parameters:
+    -----------
+    results : dict
+        Dictionary from run_gamma_sweep containing gamma, theta_mean, theta_std
+    """
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    gamma = np.array(results['gamma'])
+    theta_mean = np.array(results['theta_mean'])
+    theta_std = np.array(results['theta_std'])
+    
+    # Plot with error bars
+    ax.errorbar(gamma, theta_mean, yerr=theta_std, 
+                fmt='o-', capsize=5, capthick=2, 
+                markersize=8, linewidth=2, 
+                label='Mean θ with std dev')
+    
+    # Add reference line at theta=1 (competitive bidding)
+    ax.axhline(y=1.0, color='red', linestyle='--', 
+               linewidth=1.5, alpha=0.7, label='θ=1 (competitive)')
+    
+    # Formatting
+    ax.set_xlabel('Discount Factor (γ)', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Average Shading Factor (θ)', fontsize=12, fontweight='bold')
+    ax.set_title('Effect of Discount Factor on Bid Shading in Collusion', 
+                 fontsize=14, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=10)
+    
+    # Set x-axis limits with some padding
+    ax.set_xlim(min(gamma) - 0.01, max(gamma) + 0.01)
+    
+    plt.tight_layout()
+    plt.show()
+
+    plt.savefig('gamma_vs_theta.png', dpi=150, bbox_inches='tight')
+    
+    return fig
+
+gamma_values = [1, 0.999, 0.99, 0.95, 0.9, 0.7, 0.5]
+    
+# Run the sweep
+results = run_gamma_sweep(
+    gamma_values=gamma_values,
+    n_agents=10,
+    n_rounds=1000,
+    n_trials=5
+)
+
+# Plot results
+plot_gamma_vs_theta(results)
