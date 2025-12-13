@@ -90,6 +90,24 @@ class AllPayAuction:
             utilities=utilities,
         )
 
+# class FirstPriceAuction:
+#     def __init__(self, n_agents: int):
+#         self.n_agents = n_agents
+    
+#     def run_auction(self, bids: np.ndarray) -> AuctionOutcome:
+#         """run single auction round, return outcome"""
+#         winner_idx = np.argmax(bids)
+#         winning_bid = bids[winner_idx]
+        
+#         utilities = np.zeros(self.n_agents)
+#         # winner gets value - payment, losers get 0 (already initialized)
+        
+#         return AuctionOutcome(
+#             winner_idx=winner_idx,
+#             winning_bid=winning_bid,
+#             all_bids=bids.copy(),
+#             utilities=utilities  # agents compute their own utility since they know their v
+#         )
 
 def plot_results(n_agents, theta_hist, avg_theta_hist, efficiency_hist, revenue_hist):
     """plot auction simulation results"""
