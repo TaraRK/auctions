@@ -164,7 +164,7 @@ class FactorizedPPOAgent(Agent):
 
 def plot_multi_item_results(n_agents, n_items, theta_hist, efficiency_hist, revenue_hist):
     """Plot multi-item auction simulation results"""
-    fig, axes = plt.subplots(3, 0, figsize=(12, 10))
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 
     # ----- theta convergence: mean ± std across agents and items -----
     ax = axes[0, 0]
@@ -308,7 +308,7 @@ if __name__ == "__main__":
     agents, efficiency, revenue, theta = run_multi_item_simulation(
         n_agents=10, 
         n_items=5, 
-        n_rounds=1,
+        n_rounds=1000,
         auctions_per_episode=50
     )
 
