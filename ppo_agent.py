@@ -13,6 +13,7 @@ class PPOAgent(Agent):
         agent_id: int,
         initial_budget: float = 100.0,
         gamma: float = 0.99,
+        # discount_rate = 0.99,  
         total_auctions: int = 50,
         lr: float = 3e-4,
         gae_lambda: float = 0.95,
@@ -38,6 +39,8 @@ class PPOAgent(Agent):
         self.update_epochs = update_epochs
         self.buffer_size = buffer_size
         self.max_grad_norm = max_grad_norm
+
+        # self.discount_rate = discount_rate
 
         # state = [value, budget_fraction, auctions_remaining_fraction]
         self.actor_mean = nn.Sequential(

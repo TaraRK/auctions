@@ -90,7 +90,6 @@ class AllPayAuction:
             utilities=utilities,
         )
 
-
 def plot_results(n_agents, theta_hist, avg_theta_hist, efficiency_hist, revenue_hist):
     """plot auction simulation results"""
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
@@ -170,7 +169,8 @@ def plot_results(n_agents, theta_hist, avg_theta_hist, efficiency_hist, revenue_
 
 # usage
 def run_simulation(n_agents: int, n_rounds: int, gamma: float):
-    auction = FirstPriceAuction(n_agents)
+    # auction = FirstPriceAuction(n_agents)
+    auction = SecondPriceAuction(n_agents)
     # agents = [Agent(i) for i in range(n_agents)]
     # agents = [QLearningAgent(i) for i in range(n_agents)]
     # agents = [PPOAgent(i, initial_budget=n_rounds * 1000, total_auctions=n_rounds) for i in range(n_agents)]
@@ -257,7 +257,7 @@ def run_simulation(n_agents: int, n_rounds: int, gamma: float):
     #     print(f"individual thetas: {[np.dot(a.strategy, a.theta_options) for a in agents]}")
     
     # plot results
-    plot_results(n_agents, theta_hist, avg_theta_hist, efficiency_hist, revenue_hist)
+    # plot_results(n_agents, theta_hist, avg_theta_hist, efficiency_hist, revenue_hist)
     
     last_avg_theta = avg_theta_hist[-1]
     return agents, last_avg_theta
@@ -270,22 +270,6 @@ def run_simulation(n_agents: int, n_rounds: int, gamma: float):
 def run_gamma_sweep(gamma_values, n_agents=10, n_rounds=1000, n_trials=3):
     """
     Run collusion experiments across different gamma values.
-    
-    Parameters:
-    -----------
-    gamma_values : list or array
-        List of discount factors to test
-    n_agents : int
-        Number of agents in the auction
-    n_rounds : int
-        Number of auction rounds
-    n_trials : int
-        Number of trials per gamma value
-        
-    Returns:
-    --------
-    results : dict
-        Dictionary containing gamma values, mean theta, and std theta
     """
     results = {
         'gamma': [],
@@ -294,10 +278,10 @@ def run_gamma_sweep(gamma_values, n_agents=10, n_rounds=1000, n_trials=3):
     }
     
     # Write CSV header
-    csv_filename = 'fpa_gamma_sweep_results.csv'
+    csv_filename = 'spa_07_gamma_sweep_results.csv'
     with open(csv_filename, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['gamma', 'trial', 'theta', 'theta_mean', 'theta_std'])
+        writer.writerow(['gamma', 'theta_mean', 'theta_std'])
     
     for gamma in gamma_values:
         print(f"Running experiments for gamma = {gamma}...")
@@ -312,13 +296,13 @@ def run_gamma_sweep(gamma_values, n_agents=10, n_rounds=1000, n_trials=3):
                 gamma=gamma
             )
             theta_values.append(avg_theta)
-            
+
             # Save each trial immediately
             with open(csv_filename, 'a', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow([gamma, trial + 1, avg_theta, '', ''])
         
-        # Store aggregate results
+        # Store results
         gamma_mean = np.mean(theta_values)
         gamma_std = np.std(theta_values)
         
@@ -326,10 +310,10 @@ def run_gamma_sweep(gamma_values, n_agents=10, n_rounds=1000, n_trials=3):
         results['theta_mean'].append(gamma_mean)
         results['theta_std'].append(gamma_std)
         
-        # Append summary row for this gamma
+        # Append to CSV after each gamma
         with open(csv_filename, 'a', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow([gamma, 'summary', '', gamma_mean, gamma_std])
+            writer.writerow([gamma, gamma_mean, gamma_std])
     
     return results
 
@@ -373,51 +357,38 @@ def plot_gamma_vs_theta(results):
     plt.tight_layout()
     plt.show()
 
-    plt.savefig('gamma_vs_theta.png', dpi=150, bbox_inches='tight')
+    plt.savefig('spa_gamma_vs_theta.png', dpi=150, bbox_inches='tight')
     
     return fig
 
-gamma_values = [1, 0.999, 0.99, 0.95, 0.9, 0.7]
+# gamma_values = [1, 0.999, 0.99, 0.95, 0.9, 0.7]
+gamma_values = [0.7]
     
-# # Run the sweep
-# results = run_gamma_sweep(
-#     gamma_values=gamma_values,
-#     n_agents=10,
-#     n_rounds=50,
-#     n_trials=5
-# )
+# Run the sweep
+results = run_gamma_sweep(
+    gamma_values=gamma_values,
+    n_agents=10,
+    n_rounds=50,
+    n_trials=5
+)
+
 
 # Plot results
 # plot_gamma_vs_theta(results)
+
 import pandas as pd
 def new_plot_code(filename):
     df = pd.read_csv(filename)
-    
-    # Filter to only summary rows (where trial == 'summary')
-    summary_df = df[df['trial'] == 'summary'].copy()
-    
-    # Convert to numeric (they're strings from CSV)
-    summary_df['gamma'] = pd.to_numeric(summary_df['gamma'])
-    summary_df['theta_mean'] = pd.to_numeric(summary_df['theta_mean'])
-    summary_df['theta_std'] = pd.to_numeric(summary_df['theta_std'])
-    
-    # Sort by gamma for proper line plotting
-    summary_df = summary_df.sort_values('gamma')
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.errorbar(summary_df['gamma'], summary_df['theta_mean'], yerr=summary_df['theta_std'], 
+    ax.errorbar(df['gamma'], df['theta_mean'], yerr=df['theta_std'], 
                 marker='o', capsize=5, capthick=2, linewidth=2, markersize=8)
     ax.set_xlabel('gamma', fontsize=12)
     ax.set_ylabel('mean theta (bid/value)', fontsize=12)
-    ax.set_title('Effect of Discount Factor on Bid Shading')
     ax.grid(alpha=0.3)
     ax.set_xscale('log')
     plt.tight_layout()
-    plt.savefig('gamma_vs_theta_new.png', dpi=150, bbox_inches='tight')
     plt.show()
+    plt.savefig('spa_gamma_vs_theta_new.png', dpi=150, bbox_inches='tight')
 
-new_plot_code('fpa_gamma_sweep_results.csv')
-
-# note: the # of auctions is too small and rauise the budget
-# first run, was 50 auctions per round, 1000 rounds 
-# second run, 150 auctions per round, 250 rounds
+# new_plot_code('spa_gamma_sweep_results.csv')
