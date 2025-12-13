@@ -86,14 +86,26 @@ class PPOAgent(Agent):
         self.auctions_remaining = self.total_auctions
 
     def get_state(self, value: float) -> torch.Tensor:
-        return torch.tensor(
-            [
-                value,
-                self.budget / self.initial_budget,
-                self.auctions_remaining / self.total_auctions,
-            ],
+        # Ensure no division by zero and clamp values to reasonable ranges
+        budget_frac = self.budget / max(self.initial_budget, 1e-8)
+        auctions_frac = self.auctions_remaining / max(self.total_auctions, 1)
+        
+        # Clamp to prevent extreme values
+        budget_frac = np.clip(budget_frac, 0.0, 2.0)
+        auctions_frac = np.clip(auctions_frac, 0.0, 1.0)
+        value = np.clip(value, 0.0, 10.0)  # Reasonable upper bound
+        
+        state = torch.tensor(
+            [value, budget_frac, auctions_frac],
             dtype=torch.float32,
         )
+
+        # Verify state is valid
+        if torch.any(torch.isnan(state)) or torch.any(torch.isinf(state)):
+            # Return a safe default state
+            return torch.tensor([0.5, 1.0, 1.0], dtype=torch.float32)
+        
+        return state
 
     def draw_value(self) -> float:
         v = np.random.uniform(0.0, 1.0)
@@ -182,8 +194,20 @@ class PPOAgent(Agent):
         with torch.no_grad():
             val = self.critic(self.current_state.unsqueeze(0)).squeeze().item()
 
+        # Verify state is valid before storing
+        state_np = self.current_state.numpy()
+        if np.any(np.isnan(state_np)) or np.any(np.isinf(state_np)):
+            # Skip storing invalid state
+            return
+        
+        # Verify other values are valid
+        if not (np.isfinite(chosen_theta) and np.isfinite(self.current_logprob) and 
+                np.isfinite(utility) and np.isfinite(val)):
+            return
+        
+        
         # store transition
-        self.buffer["states"].append(self.current_state.numpy())
+        self.buffer["states"].append(state_np)
         self.buffer["actions"].append(chosen_theta)
         self.buffer["logprobs"].append(self.current_logprob)
         self.buffer["rewards"].append(utility)
@@ -199,11 +223,24 @@ class PPOAgent(Agent):
     # ---------- ppo core ----------
 
     def _ppo_update(self):
-        states = torch.tensor(np.array(self.buffer["states"]), dtype=torch.float32)   # [T,3]
-        actions = torch.tensor(self.buffer["actions"], dtype=torch.float32).unsqueeze(1)  # [T,1]
-        old_logprobs = torch.tensor(self.buffer["logprobs"], dtype=torch.float32)     # [T]
-        rewards = torch.tensor(self.buffer["rewards"], dtype=torch.float32)           # [T]
-        dones = torch.tensor(self.buffer["dones"], dtype=torch.float32)               # [T]
+        # Filter out any invalid states before processing
+        valid_indices = []
+        for i, state in enumerate(self.buffer["states"]):
+            if np.all(np.isfinite(state)):
+                valid_indices.append(i)
+        
+        if len(valid_indices) == 0:
+            # No valid states, clear buffer and return
+            for k in self.buffer:
+                self.buffer[k] = []
+            return
+        
+        # Only use valid states
+        states = torch.tensor(np.array([self.buffer["states"][i] for i in valid_indices]), dtype=torch.float32)   # [T,3]
+        actions = torch.tensor([self.buffer["actions"][i] for i in valid_indices], dtype=torch.float32).unsqueeze(1)  # [T,1]
+        old_logprobs = torch.tensor([self.buffer["logprobs"][i] for i in valid_indices], dtype=torch.float32)     # [T]
+        rewards = torch.tensor([self.buffer["rewards"][i] for i in valid_indices], dtype=torch.float32)           # [T]
+        dones = torch.tensor([self.buffer["dones"][i] for i in valid_indices], dtype=torch.float32)               # [T]
 
         # critic values at states (fixed for GAE computation)
         with torch.no_grad():

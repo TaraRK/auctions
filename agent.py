@@ -15,9 +15,9 @@ class Agent:
         """bid = v * (1 - theta)"""
         return value * self.theta
     
-    # def compute_utility(self, value: float, won: bool, price_paid: float) -> float:
-    #     """utility = v - price if won, else 0"""
-    #     return (value - price_paid) if won else 0.0
+    def compute_utility(self, value: float, won: bool, price_paid: float) -> float:
+        """utility = v - price if won, else 0"""
+        return (value - price_paid) if won else 0.0
     
     def update(self, value: float, bid: float, utility: float):
         """policy gradient update on theta"""

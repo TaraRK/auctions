@@ -276,5 +276,6 @@ def run_simulation(n_agents: int, n_rounds: int):
     return agents
 
 # test
-agents = run_simulation(n_agents=10, n_rounds=1000)
+if __name__ == "__main__":
+    agents = run_simulation(n_agents=10, n_rounds=1000)
 
